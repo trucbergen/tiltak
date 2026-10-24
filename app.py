@@ -20,7 +20,8 @@ DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot.db"
 #MODEL = "llama-3.3-70b-versatile"  # Kan endres ved behov.
 MODEL = "openai/gpt-oss-20b"
 MAX_RESULTS = 6
-MAX_LIST_RESULTS = 50
+MAX_LIST_RESULTS = 10000  # Hent alle dokumenttreff, ikke bare de forste 50
+RESULTS_PER_PAGE = 20
 MAX_CONTEXT_CHARS = 1900
 
 STOPWORDS = {
@@ -191,11 +192,26 @@ def answer_with_groq(client: Groq, question: str, results: list[dict[str, Any]],
     return (completion.choices[0].message.content or "Ingen svar generert.").strip()
 
 
-def render_more_results(results: list[dict[str, Any]], total: int) -> None:
-    if len(results) <= MAX_RESULTS:
+def render_more_results(results: list[dict[str, Any]], total: int, result_id: str) -> None:
+    """Vis alle treff utover AI-kildene, 20 per side."""
+    extra = results[MAX_RESULTS:]
+    if not extra:
         return
-    with st.expander(f"🔎 Se flere dokumenttreff ({len(results) - MAX_RESULTS} ekstra vist)"):
-        for i, doc in enumerate(results[MAX_RESULTS:], MAX_RESULTS + 1):
+
+    per_page = RESULTS_PER_PAGE
+    page_count = (len(extra) + per_page - 1) // per_page
+    with st.expander(f"🔎 Se alle dokumenttreff ({total} totalt)", expanded=False):
+        page = st.number_input(
+            "Side", min_value=1, max_value=page_count, value=1,
+            step=1, key=f"result_page_{result_id}",
+        )
+        start = (page - 1) * per_page
+        end = min(start + per_page, len(extra))
+        st.caption(
+            f"Viser dokument {MAX_RESULTS + start + 1}–{MAX_RESULTS + end} "
+            f"av {total} · Side {page} av {page_count}"
+        )
+        for i, doc in enumerate(extra[start:end], MAX_RESULTS + start + 1):
             title = doc.get("tittel") or "Dokument uten tittel"
             url = (doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
@@ -204,15 +220,13 @@ def render_more_results(results: list[dict[str, Any]], total: int) -> None:
                 st.markdown(f"**{i}. {title}**")
             if doc.get("oppsummering"):
                 st.caption(str(doc["oppsummering"])[:200])
-        if total > len(results):
-            st.caption(f"Viser {len(results)} av {total} dokumenttreff. Flere dokumenter finnes i søkeresultatene.")
 
 
 def render_search_overview(total: int, shown: int, mode: str) -> None:
     st.caption(
         f"🔎 {total} dokumenttreff ({'alle søkeord' if mode == 'AND' else 'utvidet søk'}) · "
         f"{min(MAX_RESULTS, shown)} kilder brukt i AI-svaret · "
-        f"viser opptil {MAX_LIST_RESULTS} dokumenter"
+        f"alle {total} dokumenttreff kan vises (20 per side)"
     )
     st.info(
         "AI-svaret bygger på et utvalg dokumenter, ikke alle tilbud eller aktiviteter i Bergen. "
@@ -278,7 +292,7 @@ if not st.session_state.messages:
             st.session_state.pending_question = example
             st.rerun()
 
-for message in st.session_state.messages:
+for message_index, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("sources"):
@@ -286,7 +300,7 @@ for message in st.session_state.messages:
             total = message.get("total", len(sources))
             render_search_overview(total, len(sources), message.get("search_mode", "AND"))
             render_sources(sources[:MAX_RESULTS])
-            render_more_results(sources, total)
+            render_more_results(sources, total, str(message_index))
 
 user_input = st.chat_input("Still et spørsmål om Bergen kommune ...")
 question = st.session_state.pop("pending_question", None) or user_input
@@ -319,7 +333,7 @@ if question and question.strip():
             st.markdown(answer)
             render_search_overview(total, len(results), search_mode)
             render_sources(results[:MAX_RESULTS])
-            render_more_results(results, total)
+            render_more_results(results, total, str(len(st.session_state.messages)))
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "sources": results if results else [],
                                       "total": total if results else 0,
