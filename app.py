@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot_08d_TEST.db"
 MODEL = "openai/gpt-oss-20b"
 MAX_RESULTS = 6
 MAX_LIST_RESULTS = 10000  # Hent alle dokumenttreff, ikke bare de forste 50
-RESULTS_PER_PAGE = 10
+RESULTS_PER_PAGE = 5
 MAX_CONTEXT_CHARS = 1900
 MAX_RELEVANCE_CANDIDATES = 15  # Groq vurderer bare kandidater ved utvidet sok
 
@@ -261,7 +261,6 @@ def render_documents(results: list[dict[str, Any]], total: int, result_id: str) 
     start = (page - 1) * RESULTS_PER_PAGE
     end = min(start + RESULTS_PER_PAGE, len(results))
 
-    st.markdown("### Dokumenttreff")
     st.caption(f"Viser dokument {start + 1}–{end} av {total} · Side {page} av {page_count}")
     for i, doc in enumerate(results[start:end], start + 1):
         title = html.escape(str(doc.get("tittel") or "Dokument uten tittel"))
@@ -300,8 +299,18 @@ def render_documents(results: list[dict[str, Any]], total: int, result_id: str) 
 
 
 def render_search_overview(total: int, shown: int, mode: str) -> None:
-    """Kort treffstatus uten ekstra informasjonsboks."""
-    st.caption(f"{total} dokumenttreff · 10 dokumenter per side" if mode == "AND" else f"{total} relevansvurderte dokumenter · 10 dokumenter per side")
+    """Vis treffstatus over den sammenleggbare dokumentlisten."""
+    label = "dokumenttreff" if mode == "AND" else "relevansvurderte dokumenter"
+    st.caption(f"{total} {label} · {RESULTS_PER_PAGE} dokumenter per side")
+
+
+def render_document_expander(results: list[dict[str, Any]], total: int, result_id: str, mode: str) -> None:
+    """En egen lukket dokumentboks for hvert AI-svar."""
+    if not results:
+        return
+    render_search_overview(total, len(results), mode)
+    with st.expander(f"📄 Vis dokumenter ({total} treff)", expanded=False):
+        render_documents(results, total, result_id)
 
 
 
@@ -352,8 +361,7 @@ for message_index, message in enumerate(st.session_state.messages):
         if message.get("sources"):
             sources = message["sources"]
             total = message.get("total", len(sources))
-            render_search_overview(total, len(sources), message.get("search_mode", "AND"))
-            render_documents(sources, total, str(message_index))
+            render_document_expander(sources, total, str(message_index), message.get("search_mode", "AND"))
 
 user_input = st.chat_input("Still et spørsmål om Bergen kommune ...")
 question = st.session_state.pop("pending_question", None) or user_input
@@ -400,8 +408,7 @@ if question and question.strip():
                     answer = "Dokumentene ble funnet, men Groq kunne ikke generere svar akkurat nå. Se kildene nedenfor."
                     st.warning(f"Groq-feil: {type(exc).__name__}. Kontroller modell og gratis kvote.")
             st.markdown(answer)
-            render_search_overview(total, len(results), search_mode)
-            render_documents(results, total, str(len(st.session_state.messages)))
+            render_document_expander(results, total, str(len(st.session_state.messages)), search_mode)
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "sources": results if results else [],
                                       "total": total if results else 0,
