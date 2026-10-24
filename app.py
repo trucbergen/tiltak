@@ -88,30 +88,48 @@ def fts_query(words: list[str], operator: str) -> str:
 
 
 def search_documents(question: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
+    """Samme hovedstrategi som Shiny: AND, OR ved <10 treff, metadata-bonus."""
     words = tokens_from_question(question)
     if not words:
         return []
 
-    sql = """
+    bonus_parts = []
+    bonus_params = []
+    for word in words[:8]:
+        pattern = f"%{word}%"
+        bonus_parts.extend([
+            "(CASE WHEN lower(coalesce(d.tittel,'')) LIKE ? THEN 6 ELSE 0 END)",
+            "(CASE WHEN lower(coalesce(d.malgruppe,'')) LIKE ? THEN 3 ELSE 0 END)",
+            "(CASE WHEN lower(coalesce(d.tema,'')) LIKE ? THEN 2 ELSE 0 END)",
+        ])
+        bonus_params.extend([pattern, pattern, pattern])
+    if any(w.startswith(("aktivitet", "fritid", "tilbud", "tiltak")) for w in words):
+        bonus_parts.append("(CASE WHEN lower(coalesce(d.informasjonstype,'')) LIKE '%aktivitet%' OR lower(coalesce(d.informasjonstype,'')) LIKE '%tiltak%' THEN 5 ELSE 0 END)")
+    bonus_sql = " + ".join(bonus_parts) if bonus_parts else "0"
+    # Kompakt eksport har 8 FTS-kolonner i denne rekkefolgen:
+    # tittel, oppsummering, malgruppe, geografi, tema, nokkelord,
+    # informasjonstype, tekstutdrag.
+    rank = "bm25(documents_fts, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
+    sql = f"""
         SELECT d.doc_id, d.tittel, d.url, d.oppsummering, d.tekstutdrag,
                d.tema, d.malgruppe, d.informasjonstype,
-               bm25(documents_fts, 5.0, 3.0, 2.0, 1.0, 3.0, 2.0, 2.0, 1.0) AS score
+               {rank} AS score
         FROM documents_fts
         JOIN documents d ON d.doc_id = documents_fts.rowid
         WHERE documents_fts MATCH ?
-        ORDER BY score ASC
+        ORDER BY ({rank} - ({bonus_sql})), d.doc_id
         LIMIT ?
     """
-    # Prøv først alle nøkkelord; ved 0 treff søk med ELLER.
-    # Bruk få OR-termer for å unngå svært brede søk.
     with sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
-        for operator in ("AND", "OR"):
-            terms = words if operator == "AND" else words[:6]
-            rows = conn.execute(sql, (fts_query(terms, operator), limit)).fetchall()
-            if rows:
-                return [dict(row) for row in rows]
-    return []
+        expr = fts_query(words, "AND")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?", (expr,)
+        ).fetchone()[0]
+        if len(words) > 1 and count < 10:
+            expr = fts_query(words, "OR")
+        rows = conn.execute(sql, (expr, *bonus_params, limit)).fetchall()
+        return [dict(row) for row in rows]
 
 
 def source_context(results: list[dict[str, Any]]) -> str:
@@ -173,7 +191,7 @@ def render_sources(results: list[dict[str, Any]]) -> None:
             url = (doc.get("url") or "").strip()
             st.markdown(f"**[{i}] {title}**")
             if url.startswith(("https://", "http://")):
-                st.link_button("Åpne originaldokument ↗", url, key=f"src_{st.session_state.render_id}_{i}")
+                st.markdown(f"[Åpne originaldokument ↗]({url})")
             else:
                 st.caption("Original-URL mangler.")
             if doc.get("oppsummering"):
