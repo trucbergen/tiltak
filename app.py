@@ -1,6 +1,6 @@
 """Bergen kommunal dokumentassistent – Streamlit + SQLite FTS5 + Groq.
 
-Database: app/bergen_chatbot.db, created by 08a_bergen_chatbot.R.
+Database for local test: exports/bergen_chatbot_08d_TEST.db. Do not deploy test file.
 Run: streamlit run app.py
 """
 
@@ -17,7 +17,7 @@ from groq import Groq
 
 st.set_page_config(page_title="Kommunal dokumentassistent – Bergen", page_icon="🔎", layout="centered")
 
-DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "exports" / "bergen_chatbot_08d_TEST.db"
 #MODEL = "llama-3.3-70b-versatile"  # Kan endres ved behov.
 MODEL = "openai/gpt-oss-20b"
 MAX_RESULTS = 6
@@ -30,8 +30,8 @@ STOPWORDS = {
     "finnes", "fins", "har", "er", "det", "den", "de", "der", "som", "for",
     "til", "fra", "med", "om", "og", "eller", "i", "på", "av", "et", "en",
     "jeg", "vi", "kan", "man", "du", "dere", "meg", "oss", "blir", "bli",
-    "kommunen", "kommune", "bergen", "noen", "noe", "innen", "ved", "hos",
-    "gjennom", "skal", "vil", "kunne", "være", "være", "the", "a",
+    "kommunen", "kommune", "noen", "noe", "innen", "ved", "hos",
+    "gjennom", "skal", "vil", "kunne", "være", "the", "a", "må", "ble", "finn", "ei", "her", "kommuner", "bydel", "bydelen", "bor", "trenger", "tilbyr", "tilbudet", "sine", "deres", "vår", "vårt",
 }
 
 EXAMPLES = [
@@ -73,8 +73,8 @@ def check_database(db_filename: str, mtime_ns: int) -> int:
             tables = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
             )}
-            if not {"documents", "documents_fts"}.issubset(tables):
-                raise RuntimeError("SQLite mangler documents eller documents_fts.")
+            if not {"documents", "documents_fts_full"}.issubset(tables):
+                raise RuntimeError("SQLite mangler documents eller documents_fts_full.")
             stage = "lese kolonner i documents"
             fields = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
             needed = {"doc_id", "tittel", "url", "tekstutdrag", "oppsummering"}
@@ -117,17 +117,15 @@ def search_documents(question: str, limit: int = MAX_LIST_RESULTS) -> tuple[list
     if any(w.startswith(("aktivitet", "fritid", "tilbud", "tiltak")) for w in words):
         bonus_parts.append("(CASE WHEN lower(coalesce(d.informasjonstype,'')) LIKE '%aktivitet%' OR lower(coalesce(d.informasjonstype,'')) LIKE '%tiltak%' THEN 5 ELSE 0 END)")
     bonus_sql = " + ".join(bonus_parts) if bonus_parts else "0"
-    # Kompakt eksport har 8 FTS-kolonner i denne rekkefolgen:
-    # tittel, oppsummering, malgruppe, geografi, tema, nokkelord,
-    # informasjonstype, tekstutdrag.
-    rank = "bm25(documents_fts, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
+    # Felles FTS5: tittel, body, oppsummering, malgruppe, geografi, tema, nokkelord, informasjonstype.
+    rank = "bm25(documents_fts_full, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
     sql = f"""
         SELECT d.doc_id, d.tittel, d.url, d.oppsummering, d.tekstutdrag,
                d.tema, d.malgruppe, d.informasjonstype, d.kommune, d.dokumentdato,
                {rank} AS score
-        FROM documents_fts
-        JOIN documents d ON d.rowid = documents_fts.rowid
-        WHERE documents_fts MATCH ?
+        FROM documents_fts_full
+        JOIN documents d ON d.rowid = documents_fts_full.rowid
+        WHERE documents_fts_full MATCH ?
         ORDER BY ({rank} - ({bonus_sql})), d.doc_id
         LIMIT ?
     """
@@ -135,14 +133,14 @@ def search_documents(question: str, limit: int = MAX_LIST_RESULTS) -> tuple[list
         conn.row_factory = sqlite3.Row
         expr = fts_query(words, "AND")
         count = conn.execute(
-            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?", (expr,)
+            "SELECT COUNT(*) FROM documents_fts_full WHERE documents_fts_full MATCH ?", (expr,)
         ).fetchone()[0]
         mode = "AND"
         if len(words) > 1 and count < 10:
             expr = fts_query(words, "OR")
             mode = "OR"
             count = conn.execute(
-                "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?", (expr,)
+                "SELECT COUNT(*) FROM documents_fts_full WHERE documents_fts_full MATCH ?", (expr,)
             ).fetchone()[0]
         rows = conn.execute(sql, (expr, *bonus_params, limit)).fetchall()
         return [dict(row) for row in rows], count, mode
@@ -266,7 +264,7 @@ st.markdown(
 )
 
 if not DB_PATH.is_file():
-    st.error("Finner ikke bergen_chatbot.db ved siden av app.py.")
+    st.error("Finner ikke lokal testdatabase i exports/bergen_chatbot_08d_TEST.db.")
     st.code(str(DB_PATH))
     st.stop()
 
