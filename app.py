@@ -20,6 +20,7 @@ DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot.db"
 #MODEL = "llama-3.3-70b-versatile"  # Kan endres ved behov.
 MODEL = "openai/gpt-oss-20b"
 MAX_RESULTS = 6
+MAX_LIST_RESULTS = 50
 MAX_CONTEXT_CHARS = 1900
 
 STOPWORDS = {
@@ -87,11 +88,11 @@ def fts_query(words: list[str], operator: str) -> str:
     return f" {operator} ".join('"' + w.replace('"', '') + '"' for w in words)
 
 
-def search_documents(question: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
+def search_documents(question: str, limit: int = MAX_LIST_RESULTS) -> tuple[list[dict[str, Any]], int, str]:
     """Samme hovedstrategi som Shiny: AND, OR ved <10 treff, metadata-bonus."""
     words = tokens_from_question(question)
     if not words:
-        return []
+        return [], 0, "AND"
 
     bonus_parts = []
     bonus_params = []
@@ -126,10 +127,15 @@ def search_documents(question: str, limit: int = MAX_RESULTS) -> list[dict[str, 
         count = conn.execute(
             "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?", (expr,)
         ).fetchone()[0]
+        mode = "AND"
         if len(words) > 1 and count < 10:
             expr = fts_query(words, "OR")
+            mode = "OR"
+            count = conn.execute(
+                "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?", (expr,)
+            ).fetchone()[0]
         rows = conn.execute(sql, (expr, *bonus_params, limit)).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in rows], count, mode
 
 
 def source_context(results: list[dict[str, Any]]) -> str:
@@ -152,6 +158,9 @@ def answer_with_groq(client: Groq, question: str, results: list[dict[str, Any]],
     system = (
         "Du er en nøktern norsk dokumentassistent. Du svarer bare ut fra "
         "kildetekstene som følger med det aktuelle spørsmålet. "
+        "Du bruker bare et utvalg av de mest relevante dokumentene, ikke alle søkeresultatene. "
+        "Beskriv dokumenterte tilbud som eksempler, aldri som en fullstendig oversikt. "
+        "Unngå utsagn om at det ikke finnes flere tilbud eller aktiviteter. "
         "Kildene er hentet fra en dokumentdatabase og kan inneholde utdrag, "
         "ikke hele dokumentet. Hvis kildene ikke gir tilstrekkelig grunnlag, "
         "si tydelig hva du ikke kan fastslå. Ikke finn på tilbud, åpningstider, "
@@ -180,6 +189,35 @@ def answer_with_groq(client: Groq, question: str, results: list[dict[str, Any]],
         max_tokens=750,
     )
     return (completion.choices[0].message.content or "Ingen svar generert.").strip()
+
+
+def render_more_results(results: list[dict[str, Any]], total: int) -> None:
+    if len(results) <= MAX_RESULTS:
+        return
+    with st.expander(f"🔎 Se flere dokumenttreff ({len(results) - MAX_RESULTS} ekstra vist)"):
+        for i, doc in enumerate(results[MAX_RESULTS:], MAX_RESULTS + 1):
+            title = doc.get("tittel") or "Dokument uten tittel"
+            url = (doc.get("url") or "").strip()
+            if url.startswith(("https://", "http://")):
+                st.markdown(f"**{i}.** [{title}]({url})")
+            else:
+                st.markdown(f"**{i}. {title}**")
+            if doc.get("oppsummering"):
+                st.caption(str(doc["oppsummering"])[:200])
+        if total > len(results):
+            st.caption(f"Viser {len(results)} av {total} dokumenttreff. Flere dokumenter finnes i søkeresultatene.")
+
+
+def render_search_overview(total: int, shown: int, mode: str) -> None:
+    st.caption(
+        f"🔎 {total} dokumenttreff ({'alle søkeord' if mode == 'AND' else 'utvidet søk'}) · "
+        f"{min(MAX_RESULTS, shown)} kilder brukt i AI-svaret · "
+        f"viser opptil {MAX_LIST_RESULTS} dokumenter"
+    )
+    st.info(
+        "AI-svaret bygger på et utvalg dokumenter, ikke alle tilbud eller aktiviteter i Bergen. "
+        "Flere relevante dokumenter kan finnes i søkeresultatene."
+    )
 
 
 def render_sources(results: list[dict[str, Any]]) -> None:
@@ -244,8 +282,11 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("sources"):
-            st.session_state.render_id += 1
-            render_sources(message["sources"])
+            sources = message["sources"]
+            total = message.get("total", len(sources))
+            render_search_overview(total, len(sources), message.get("search_mode", "AND"))
+            render_sources(sources[:MAX_RESULTS])
+            render_more_results(sources, total)
 
 user_input = st.chat_input("Still et spørsmål om Bergen kommune ...")
 question = st.session_state.pop("pending_question", None) or user_input
@@ -260,7 +301,7 @@ if question and question.strip():
     with st.chat_message("assistant"):
         with st.spinner("Søker i dokumentene ..."):
             try:
-                results = search_documents(question)
+                results, total, search_mode = search_documents(question)
             except sqlite3.Error as exc:
                 st.error(f"Feil i SQLite-søket: {exc}")
                 st.stop()
@@ -271,14 +312,17 @@ if question and question.strip():
         else:
             with st.spinner("Lager svar basert på dokumentene ..."):
                 try:
-                    answer = answer_with_groq(get_client(api_key), question, results, previous)
+                    answer = answer_with_groq(get_client(api_key), question, results[:MAX_RESULTS], previous)
                 except Exception as exc:
                     answer = "Dokumentene ble funnet, men Groq kunne ikke generere svar akkurat nå. Se kildene nedenfor."
                     st.warning(f"Groq-feil: {type(exc).__name__}. Kontroller modell og gratis kvote.")
             st.markdown(answer)
-            st.session_state.render_id += 1
-            render_sources(results)
+            render_search_overview(total, len(results), search_mode)
+            render_sources(results[:MAX_RESULTS])
+            render_more_results(results, total)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": results if results else []})
+    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": results if results else [],
+                                      "total": total if results else 0,
+                                      "search_mode": search_mode if results else "AND"})
 
 st.caption("Svar er generert fra begrensede dokumentutdrag. Kontroller alltid originaldokumentene.")
