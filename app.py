@@ -254,15 +254,8 @@ def render_documents(results: list[dict[str, Any]], total: int, result_id: str) 
 
 
 def render_search_overview(total: int, shown: int, mode: str) -> None:
-    st.caption(
-        f"🔎 {total} dokumenttreff ({'alle søkeord' if mode == 'AND' else 'utvidet søk'}) · "
-        f"{min(MAX_RESULTS, shown)} kilder brukt i AI-svaret · "
-        f"alle {total} dokumenttreff vises i listen (10 per side)"
-    )
-    st.info(
-        "AI-svaret bygger på et utvalg dokumenter, ikke alle tilbud eller aktiviteter i Bergen. "
-        "Flere relevante dokumenter kan finnes i søkeresultatene."
-    )
+    """Kort treffstatus uten ekstra informasjonsboks."""
+    st.caption(f"{total} dokumenttreff · 10 dokumenter per side")
 
 
 
