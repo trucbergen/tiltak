@@ -17,7 +17,9 @@ from groq import Groq
 
 st.set_page_config(page_title="Kommunal dokumentassistent – Bergen", page_icon="🔎", layout="centered")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "exports" / "bergen_chatbot_08d_TEST.db"
+#DB_PATH = Path(__file__).resolve().parent.parent / "exports" / "bergen_chatbot_08d_TEST.db"
+DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot_08d_TEST.db"
+
 #MODEL = "llama-3.3-70b-versatile"  # Kan endres ved behov.
 MODEL = "openai/gpt-oss-20b"
 MAX_RESULTS = 6
