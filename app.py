@@ -7,6 +7,7 @@ Run: streamlit run app.py
 from __future__ import annotations
 
 import re
+import html
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -65,8 +66,8 @@ def get_client(api_key: str) -> Groq:
 
 @st.cache_data(show_spinner=False)
 def check_database(db_filename: str, mtime_ns: int) -> int:
-    """Kontroller schema og antall dokumenter uten å holde en global SQLite-tilkobling."""
-    with sqlite3.connect(Path(db_filename).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+    """Kontroller skjema og dokumenttall med en separat tilkobling."""
+    with sqlite3.connect(f"file:{Path(db_filename).as_posix()}?mode=ro", uri=True) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
         if not {"documents", "documents_fts"}.issubset(tables):
             raise RuntimeError("SQLite mangler documents eller documents_fts.")
@@ -74,21 +75,7 @@ def check_database(db_filename: str, mtime_ns: int) -> int:
         needed = {"doc_id", "tittel", "url", "tekstutdrag", "oppsummering"}
         if not needed.issubset(fields):
             raise RuntimeError("SQLite mangler kolonner: " + ", ".join(sorted(needed - fields)))
-        count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        # Test FTS5 separat. En vellykket COUNT(*) fra documents beviser
-        # ikke at FTS-indeksen i filen paa Streamlit Cloud er lesbar.
-        try:
-            conn.execute(
-                "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
-                ('"barn"',),
-            ).fetchone()
-        except sqlite3.DatabaseError as exc:
-            raise RuntimeError(
-                "FTS5-indeksen kan ikke leses i den opplastede databasefilen: "
-                f"{exc}. Kontroller den lokale filen med PRAGMA integrity_check, "
-                "og last opp en ny, lukket SQLite-kopi til GitHub."
-            ) from exc
-        return count
+        return conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
 
 def tokens_from_question(question: str) -> list[str]:
@@ -128,7 +115,7 @@ def search_documents(question: str, limit: int = MAX_LIST_RESULTS) -> tuple[list
     rank = "bm25(documents_fts, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
     sql = f"""
         SELECT d.doc_id, d.tittel, d.url, d.oppsummering, d.tekstutdrag,
-               d.tema, d.malgruppe, d.informasjonstype,
+               d.tema, d.malgruppe, d.informasjonstype, d.kommune, d.dokumentdato,
                {rank} AS score
         FROM documents_fts
         JOIN documents d ON d.rowid = documents_fts.rowid
@@ -136,7 +123,7 @@ def search_documents(question: str, limit: int = MAX_LIST_RESULTS) -> tuple[list
         ORDER BY ({rank} - ({bonus_sql})), d.doc_id
         LIMIT ?
     """
-    with sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+    with sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
         expr = fts_query(words, "AND")
         count = conn.execute(
@@ -206,83 +193,69 @@ def answer_with_groq(client: Groq, question: str, results: list[dict[str, Any]],
     return (completion.choices[0].message.content or "Ingen svar generert.").strip()
 
 
-def render_more_results(results: list[dict[str, Any]], total: int, result_id: str) -> None:
-    """Vis resten av treffene, 10 per side, med Forrige/Neste."""
-    extra = results[MAX_RESULTS:]
-    if not extra:
+def render_documents(results: list[dict[str, Any]], total: int, result_id: str) -> None:
+    """Vis alle treff, ogsa de seks AI-kildene, som Shiny-lignende kort."""
+    if not results:
         return
-
-    per_page = RESULTS_PER_PAGE
-    page_count = (len(extra) + per_page - 1) // per_page
+    page_count = (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
     page_key = f"result_page_{result_id}"
     if page_key not in st.session_state:
         st.session_state[page_key] = 1
-
-    # En tidligere lagret side kan bli ugyldig dersom resultatlisten endres.
     st.session_state[page_key] = min(max(st.session_state[page_key], 1), page_count)
-    with st.container():
-        st.markdown(f"**🔎 Flere dokumenttreff ({len(extra)} i tillegg til de {min(MAX_RESULTS, len(results))} AI-kildene)**")
-        page = st.session_state[page_key]
-        start = (page - 1) * per_page
-        end = min(start + per_page, len(extra))
-        st.caption(
-            f"Viser dokument {MAX_RESULTS + start + 1}–{MAX_RESULTS + end} "
-            f"av {total} · Side {page} av {page_count}"
-        )
-        for i, doc in enumerate(extra[start:end], MAX_RESULTS + start + 1):
-            title = doc.get("tittel") or "Dokument uten tittel"
-            url = (doc.get("url") or "").strip()
-            if url.startswith(("https://", "http://")):
-                st.markdown(f"**{i}.** [{title}]({url})")
-            else:
-                st.markdown(f"**{i}. {title}**")
-            if doc.get("oppsummering"):
-                st.caption(str(doc["oppsummering"])[:200])
+    page = st.session_state[page_key]
+    start = (page - 1) * RESULTS_PER_PAGE
+    end = min(start + RESULTS_PER_PAGE, len(results))
 
-        previous_col, counter_col, next_col = st.columns([1, 2, 1])
-        with previous_col:
-            if st.button("← Forrige", key=f"prev_{result_id}", disabled=page <= 1,
-                         use_container_width=True):
-                st.session_state[page_key] = page - 1
-                st.rerun()
-        with counter_col:
-            st.markdown(f"<p style='text-align:center'>Side {page} av {page_count}</p>",
-                        unsafe_allow_html=True)
-        with next_col:
-            if st.button("Neste →", key=f"next_{result_id}", disabled=page >= page_count,
-                         use_container_width=True):
-                st.session_state[page_key] = page + 1
-                st.rerun()
+    st.markdown("### Dokumenttreff")
+    st.caption(f"Viser dokument {start + 1}–{end} av {total} · Side {page} av {page_count}")
+    for i, doc in enumerate(results[start:end], start + 1):
+        title = html.escape(str(doc.get("tittel") or "Dokument uten tittel"))
+        kommune = html.escape(str(doc.get("kommune") or "Bergen"))
+        dato = html.escape(str(doc.get("dokumentdato") or "–"))
+        typ = html.escape(str(doc.get("informasjonstype") or "–"))
+        summary = html.escape(str(doc.get("oppsummering") or "Ingen oppsummering tilgjengelig."))
+        malgruppe = html.escape(str(doc.get("malgruppe") or "–"))
+        tema = html.escape(str(doc.get("tema") or "–"))
+        url = str(doc.get("url") or "").strip()
+        with st.container(border=True):
+            st.markdown(f"#### {i}. {title}")
+            st.caption(f"Kilde: Bergen | Kommune: {kommune} | Dato: {dato} | Type: {typ}")
+            st.markdown(summary)
+            st.caption(f"Målgruppe: {malgruppe} | Tema: {tema}")
+            if url.startswith(("https://", "http://")):
+                st.markdown(f"[Åpne originalkilde]({url})")
+            else:
+                st.caption("Originalkilde mangler")
+            if i <= MAX_RESULTS:
+                st.caption("Kilde brukt i AI-svaret")
+
+    left, middle, right = st.columns([1, 2, 1])
+    with left:
+        if st.button("← Forrige", key=f"prev_{result_id}", disabled=page <= 1,
+                     use_container_width=True):
+            st.session_state[page_key] = page - 1
+            st.rerun()
+    with middle:
+        st.markdown(f"<p style='text-align:center'>Side {page} av {page_count}</p>",
+                    unsafe_allow_html=True)
+    with right:
+        if st.button("Neste →", key=f"next_{result_id}", disabled=page >= page_count,
+                     use_container_width=True):
+            st.session_state[page_key] = page + 1
+            st.rerun()
 
 
 def render_search_overview(total: int, shown: int, mode: str) -> None:
     st.caption(
         f"🔎 {total} dokumenttreff ({'alle søkeord' if mode == 'AND' else 'utvidet søk'}) · "
         f"{min(MAX_RESULTS, shown)} kilder brukt i AI-svaret · "
-        f"alle {total} dokumenttreff kan vises (10 per side)"
+        f"alle {total} dokumenttreff vises i listen (10 per side)"
     )
     st.info(
         "AI-svaret bygger på et utvalg dokumenter, ikke alle tilbud eller aktiviteter i Bergen. "
         "Flere relevante dokumenter kan finnes i søkeresultatene."
     )
 
-
-def render_sources(results: list[dict[str, Any]]) -> None:
-    if not results:
-        return
-    with st.expander(f"📄 Kilder ({len(results)} dokumenter)", expanded=False):
-        for i, doc in enumerate(results, 1):
-            title = doc.get("tittel") or "Dokument uten tittel"
-            url = (doc.get("url") or "").strip()
-            st.markdown(f"**[{i}] {title}**")
-            if url.startswith(("https://", "http://")):
-                st.markdown(f"[Åpne originaldokument ↗]({url})")
-            else:
-                st.caption("Original-URL mangler.")
-            if doc.get("oppsummering"):
-                st.caption(str(doc["oppsummering"])[:300])
-            if i < len(results):
-                st.divider()
 
 
 st.markdown(
@@ -332,8 +305,7 @@ for message_index, message in enumerate(st.session_state.messages):
             sources = message["sources"]
             total = message.get("total", len(sources))
             render_search_overview(total, len(sources), message.get("search_mode", "AND"))
-            render_sources(sources[:MAX_RESULTS])
-            render_more_results(sources, total, str(message_index))
+            render_documents(sources, total, str(message_index))
 
 user_input = st.chat_input("Still et spørsmål om Bergen kommune ...")
 question = st.session_state.pop("pending_question", None) or user_input
@@ -365,8 +337,7 @@ if question and question.strip():
                     st.warning(f"Groq-feil: {type(exc).__name__}. Kontroller modell og gratis kvote.")
             st.markdown(answer)
             render_search_overview(total, len(results), search_mode)
-            render_sources(results[:MAX_RESULTS])
-            render_more_results(results, total, str(len(st.session_state.messages)))
+            render_documents(results, total, str(len(st.session_state.messages)))
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "sources": results if results else [],
                                       "total": total if results else 0,
