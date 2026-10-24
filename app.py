@@ -234,8 +234,7 @@ def render_documents(results: list[dict[str, Any]], total: int, result_id: str) 
                 st.markdown(f"[Åpne originalkilde]({url})")
             else:
                 st.caption("Originalkilde mangler")
-            if i <= MAX_RESULTS:
-                st.caption("Kilde brukt i AI-svaret")
+           
 
     left, middle, right = st.columns([1, 2, 1])
     with left:
@@ -266,7 +265,7 @@ st.markdown(
 )
 
 if not DB_PATH.is_file():
-    st.error("Finner ikke lokal testdatabase i exports/bergen_chatbot_08d_TEST.db.")
+    st.error(f"Finner ikke databasen: {DB_PATH.name}")
     st.code(str(DB_PATH))
     st.stop()
 
