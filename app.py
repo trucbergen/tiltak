@@ -66,7 +66,7 @@ def get_client(api_key: str) -> Groq:
 @st.cache_data(show_spinner=False)
 def check_database(db_filename: str, mtime_ns: int) -> int:
     """Kontroller schema og antall dokumenter uten å holde en global SQLite-tilkobling."""
-    with sqlite3.connect(db_filename) as conn:
+    with sqlite3.connect(Path(db_filename).resolve().as_uri() + "?mode=ro", uri=True) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
         if not {"documents", "documents_fts"}.issubset(tables):
             raise RuntimeError("SQLite mangler documents eller documents_fts.")
@@ -74,7 +74,21 @@ def check_database(db_filename: str, mtime_ns: int) -> int:
         needed = {"doc_id", "tittel", "url", "tekstutdrag", "oppsummering"}
         if not needed.issubset(fields):
             raise RuntimeError("SQLite mangler kolonner: " + ", ".join(sorted(needed - fields)))
-        return conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        # Test FTS5 separat. En vellykket COUNT(*) fra documents beviser
+        # ikke at FTS-indeksen i filen paa Streamlit Cloud er lesbar.
+        try:
+            conn.execute(
+                "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+                ('"barn"',),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                "FTS5-indeksen kan ikke leses i den opplastede databasefilen: "
+                f"{exc}. Kontroller den lokale filen med PRAGMA integrity_check, "
+                "og last opp en ny, lukket SQLite-kopi til GitHub."
+            ) from exc
+        return count
 
 
 def tokens_from_question(question: str) -> list[str]:
@@ -117,12 +131,12 @@ def search_documents(question: str, limit: int = MAX_LIST_RESULTS) -> tuple[list
                d.tema, d.malgruppe, d.informasjonstype,
                {rank} AS score
         FROM documents_fts
-        JOIN documents d ON d.doc_id = documents_fts.rowid
+        JOIN documents d ON d.rowid = documents_fts.rowid
         WHERE documents_fts MATCH ?
         ORDER BY ({rank} - ({bonus_sql})), d.doc_id
         LIMIT ?
     """
-    with sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True) as conn:
+    with sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
         expr = fts_query(words, "AND")
         count = conn.execute(
