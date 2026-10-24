@@ -350,10 +350,10 @@ if st.button("Start ny samtale", type="secondary"):
 
 if not st.session_state.messages:
     st.markdown("**Prøv et spørsmål:**")
-    for i, example in enumerate(EXAMPLES):
-        if st.button(example, key=f"example_{i}", use_container_width=True):
-            st.session_state.pending_question = example
-            st.rerun()
+    st.caption(
+        'Skriv med egne ord, for eksempel: '
+        '«Hvilke aktiviteter finnes for ungdom i Åsane?»'
+    )
 
 for message_index, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
@@ -363,8 +363,8 @@ for message_index, message in enumerate(st.session_state.messages):
             total = message.get("total", len(sources))
             render_document_expander(sources, total, str(message_index), message.get("search_mode", "AND"))
 
-user_input = st.chat_input("Still et spørsmål om Bergen kommune ...")
-question = st.session_state.pop("pending_question", None) or user_input
+user_input = st.chat_input("Skriv eller lim inn spørsmålet ditt her ...")
+question = user_input
 
 if question and question.strip():
     question = question.strip()[:1200]
