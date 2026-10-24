@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot.db"
 MODEL = "openai/gpt-oss-20b"
 MAX_RESULTS = 6
 MAX_LIST_RESULTS = 10000  # Hent alle dokumenttreff, ikke bare de forste 50
-RESULTS_PER_PAGE = 20
+RESULTS_PER_PAGE = 10
 MAX_CONTEXT_CHARS = 1900
 
 STOPWORDS = {
@@ -193,18 +193,21 @@ def answer_with_groq(client: Groq, question: str, results: list[dict[str, Any]],
 
 
 def render_more_results(results: list[dict[str, Any]], total: int, result_id: str) -> None:
-    """Vis alle treff utover AI-kildene, 20 per side."""
+    """Vis resten av treffene, 10 per side, med Forrige/Neste."""
     extra = results[MAX_RESULTS:]
     if not extra:
         return
 
     per_page = RESULTS_PER_PAGE
     page_count = (len(extra) + per_page - 1) // per_page
-    with st.expander(f"🔎 Se alle dokumenttreff ({total} totalt)", expanded=False):
-        page = st.number_input(
-            "Side", min_value=1, max_value=page_count, value=1,
-            step=1, key=f"result_page_{result_id}",
-        )
+    page_key = f"result_page_{result_id}"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
+
+    # En tidligere lagret side kan bli ugyldig dersom resultatlisten endres.
+    st.session_state[page_key] = min(max(st.session_state[page_key], 1), page_count)
+    with st.expander(f"🔎 Se flere dokumenttreff ({total} totalt)", expanded=False):
+        page = st.session_state[page_key]
         start = (page - 1) * per_page
         end = min(start + per_page, len(extra))
         st.caption(
@@ -221,12 +224,27 @@ def render_more_results(results: list[dict[str, Any]], total: int, result_id: st
             if doc.get("oppsummering"):
                 st.caption(str(doc["oppsummering"])[:200])
 
+        previous_col, counter_col, next_col = st.columns([1, 2, 1])
+        with previous_col:
+            if st.button("← Forrige", key=f"prev_{result_id}", disabled=page <= 1,
+                         use_container_width=True):
+                st.session_state[page_key] = page - 1
+                st.rerun()
+        with counter_col:
+            st.markdown(f"<p style='text-align:center'>Side {page} av {page_count}</p>",
+                        unsafe_allow_html=True)
+        with next_col:
+            if st.button("Neste →", key=f"next_{result_id}", disabled=page >= page_count,
+                         use_container_width=True):
+                st.session_state[page_key] = page + 1
+                st.rerun()
+
 
 def render_search_overview(total: int, shown: int, mode: str) -> None:
     st.caption(
         f"🔎 {total} dokumenttreff ({'alle søkeord' if mode == 'AND' else 'utvidet søk'}) · "
         f"{min(MAX_RESULTS, shown)} kilder brukt i AI-svaret · "
-        f"alle {total} dokumenttreff kan vises (20 per side)"
+        f"alle {total} dokumenttreff kan vises (10 per side)"
     )
     st.info(
         "AI-svaret bygger på et utvalg dokumenter, ikke alle tilbud eller aktiviteter i Bergen. "
