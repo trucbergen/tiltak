@@ -64,18 +64,26 @@ def get_client(api_key: str) -> Groq:
     return Groq(api_key=api_key, timeout=60.0, max_retries=1)
 
 
-@st.cache_data(show_spinner=False)
 def check_database(db_filename: str, mtime_ns: int) -> int:
-    """Kontroller skjema og dokumenttall med en separat tilkobling."""
-    with sqlite3.connect(f"file:{Path(db_filename).as_posix()}?mode=ro", uri=True) as conn:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
-        if not {"documents", "documents_fts"}.issubset(tables):
-            raise RuntimeError("SQLite mangler documents eller documents_fts.")
-        fields = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
-        needed = {"doc_id", "tittel", "url", "tekstutdrag", "oppsummering"}
-        if not needed.issubset(fields):
-            raise RuntimeError("SQLite mangler kolonner: " + ", ".join(sorted(needed - fields)))
-        return conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    """Diagnostiser hvilken operasjon som feiler i Streamlit Cloud."""
+    stage = "åpne SQLite-filen"
+    try:
+        with sqlite3.connect(f"file:{Path(db_filename).as_posix()}?mode=ro", uri=True) as conn:
+            stage = "lese sqlite_master"
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+            )}
+            if not {"documents", "documents_fts"}.issubset(tables):
+                raise RuntimeError("SQLite mangler documents eller documents_fts.")
+            stage = "lese kolonner i documents"
+            fields = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
+            needed = {"doc_id", "tittel", "url", "tekstutdrag", "oppsummering"}
+            if not needed.issubset(fields):
+                raise RuntimeError("SQLite mangler kolonner: " + ", ".join(sorted(needed - fields)))
+            stage = "telle dokumenter"
+            return conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    except (sqlite3.Error, RuntimeError) as exc:
+        raise RuntimeError(f"Feil ved {stage}: {exc}") from exc
 
 
 def tokens_from_question(question: str) -> list[str]:
@@ -206,6 +214,7 @@ def render_documents(results: list[dict[str, Any]], total: int, result_id: str) 
     start = (page - 1) * RESULTS_PER_PAGE
     end = min(start + RESULTS_PER_PAGE, len(results))
 
+    st.markdown("### Dokumenttreff")
     st.caption(f"Viser dokument {start + 1}–{end} av {total} · Side {page} av {page_count}")
     for i, doc in enumerate(results[start:end], start + 1):
         title = html.escape(str(doc.get("tittel") or "Dokument uten tittel"))
@@ -245,9 +254,15 @@ def render_documents(results: list[dict[str, Any]], total: int, result_id: str) 
 
 
 def render_search_overview(total: int, shown: int, mode: str) -> None:
-    """Kompakt treffoversikt uten ekstra infoboks."""
-    st.markdown("### Dokumenttreff")
-    st.caption(f"{total} dokumenttreff · 10 dokumenter per side · {min(MAX_RESULTS, shown)} kilder brukt i AI-oppsummeringen")
+    st.caption(
+        f"🔎 {total} dokumenttreff ({'alle søkeord' if mode == 'AND' else 'utvidet søk'}) · "
+        f"{min(MAX_RESULTS, shown)} kilder brukt i AI-svaret · "
+        f"alle {total} dokumenttreff vises i listen (10 per side)"
+    )
+    st.info(
+        "AI-svaret bygger på et utvalg dokumenter, ikke alle tilbud eller aktiviteter i Bergen. "
+        "Flere relevante dokumenter kan finnes i søkeresultatene."
+    )
 
 
 
@@ -266,6 +281,7 @@ try:
     doc_count = check_database(str(DB_PATH), DB_PATH.stat().st_mtime_ns)
 except (sqlite3.Error, RuntimeError) as exc:
     st.error(f"Kunne ikke lese SQLite-databasen: {exc}")
+    st.caption(f"Databasefil i Streamlit: {DB_PATH.name} · {DB_PATH.stat().st_size:,} byte".replace(",", " "))
     st.stop()
 
 api_key = get_api_key()
