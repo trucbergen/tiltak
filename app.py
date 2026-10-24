@@ -206,7 +206,8 @@ def render_more_results(results: list[dict[str, Any]], total: int, result_id: st
 
     # En tidligere lagret side kan bli ugyldig dersom resultatlisten endres.
     st.session_state[page_key] = min(max(st.session_state[page_key], 1), page_count)
-    with st.expander(f"🔎 Se flere dokumenttreff ({total} totalt)", expanded=False):
+    with st.container():
+        st.markdown(f"**🔎 Flere dokumenttreff ({len(extra)} i tillegg til de {min(MAX_RESULTS, len(results))} AI-kildene)**")
         page = st.session_state[page_key]
         start = (page - 1) * per_page
         end = min(start + per_page, len(extra))
@@ -255,7 +256,7 @@ def render_search_overview(total: int, shown: int, mode: str) -> None:
 def render_sources(results: list[dict[str, Any]]) -> None:
     if not results:
         return
-    with st.expander(f"📄 Kilder ({len(results)} dokumenter)", expanded=True):
+    with st.expander(f"📄 Kilder ({len(results)} dokumenter)", expanded=False):
         for i, doc in enumerate(results, 1):
             title = doc.get("tittel") or "Dokument uten tittel"
             url = (doc.get("url") or "").strip()
