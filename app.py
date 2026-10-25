@@ -260,7 +260,18 @@ if question:
         st.markdown(answer)
         if results:
             with st.expander(f"📄 Vis dokumenter ({total} treff)"):
-                render_docs(results,total,str(len(st.session_state.messages)))
+                #render_docs(results,total,str(len(st.session_state.messages)))
+                url = str(url or "").strip()
+
+if url.startswith(("https://", "http://")):
+    st.link_button(
+        "Åpne originaldokument",
+        url,
+        key=f"url_{key}_{i}"
+    )
+else:
+    st.caption("Originaldokument mangler gyldig lenke")
+                
     st.session_state.messages.append({"role":"assistant","content":answer,"sources":results,"total":total,"mode":search_mode})
 
 st.caption("AI-svar bygger på et begrenset utvalg dokumentutdrag. Kontroller alltid originalkildene.")
