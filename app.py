@@ -19,9 +19,14 @@ st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", la
 DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 # Gemini-modeller i prioritert rekkefolge. Ved 429/503/504 provs neste modell.
-# Flash gir bedre relevans enn Lite; Lite er billigere reserve ved kvotefeil.
-GEMINI_MODELS = ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-TRANSIENT_STATUS = ("429", "503", "504")
+# Testperiode: bare Flash-Lite (billig, gratisnivaa). Flash kan legges til forst
+# i listen senere: "gemini-3.5-flash".
+GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+# Forstevalget far kort timeout, slik at en treg/overbelastet modell ikke
+# holder brukeren 20 sekunder for reserven slipper til (millisekunder).
+GEMINI_FIRST_TIMEOUT_MS = 15000
+GEMINI_FALLBACK_TIMEOUT_MS = 20000
+TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 6
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
@@ -57,11 +62,11 @@ def groq_client(key):
 
 
 @st.cache_resource(show_spinner=False)
-def gemini_client(key):
+def gemini_client(key, timeout_ms=GEMINI_FALLBACK_TIMEOUT_MS):
     from google import genai
     from google.genai import types
-    # Kortere nettverks-timeout enn SDK-standard, i millisekunder.
-    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=20000))
+    # Egen klient per timeout; caches per (nokkel, timeout).
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_ms))
 
 
 def error_status(exc):
@@ -78,8 +83,20 @@ def error_status(exc):
     return str(status) if status is not None else None
 
 
+def is_timeout(exc):
+    text = (type(exc).__name__ + " " + str(exc)).lower()
+    return "timeout" in text or "timed out" in text or "deadline" in text
+
+
 def is_transient(exc):
-    return error_status(exc) in TRANSIENT_STATUS
+    return error_status(exc) in TRANSIENT_STATUS or is_timeout(exc)
+
+
+def short_failure(model, exc):
+    """Kort beskrivelse av et mislykket modellforsok, uten nokler."""
+    if is_timeout(exc):
+        return f"{model}: tidsavbrudd"
+    return f"{model}: HTTP {error_status(exc) or 'ukjent'}"
 
 
 def safe_api_error(exc):
@@ -254,6 +271,10 @@ SYSTEM_PROMPT = (
     "og eventuelle vilkår, med kildehenvisning [n] ved hver opplysning. "
     "Pris er ikke et vilkår; oppgi det som pris hvis det er dokumentert. "
     "Ta bare med felter som kildene faktisk dokumenterer. "
+    "AKUTT FARE: "
+    "Hvis spørsmålet gjelder akutt fare for liv eller helse, start alltid med "
+    "nødnumrene 112 (politi), 113 (medisinsk nødhjelp) og 110 (brann), "
+    "selv om de ikke står i kildene. Dette er eneste unntak fra kilderegelen. "
     "KONTAKTDETALJER: "
     "Ikke oppgi telefonnummer, e-postadresser, postadresser, gateadresser "
     "eller apningstider i svarene, selv om de finnes i kildene. "
@@ -399,14 +420,17 @@ def generate_gemini(user_prompt, recent):
     # Midlertidige feil (429/503/504) gjelder ofte bare en modell:
     # prov neste modell i listen. Andre feil returneres umiddelbart.
     last_exc = None
-    for model in GEMINI_MODELS:
+    failures = []
+    for i, model in enumerate(GEMINI_MODELS):
+        timeout_ms = GEMINI_FIRST_TIMEOUT_MS if i == 0 else GEMINI_FALLBACK_TIMEOUT_MS
         try:
-            result = gemini_client(key).models.generate_content(
+            result = gemini_client(key, timeout_ms).models.generate_content(
                 model=model, contents=contents, config=config,
             )
         except Exception as exc:
             if not is_transient(exc):
                 raise
+            failures.append(short_failure(model, exc))
             last_exc = exc
             continue
         text = (result.text or "").strip()
@@ -419,6 +443,7 @@ def generate_gemini(user_prompt, recent):
             "input": getattr(usage, "prompt_token_count", None),
             "output": getattr(usage, "candidates_token_count", None),
             "model": model,
+            "fallback": failures,
         }
     raise last_exc
 
@@ -473,6 +498,8 @@ def render_answer_meta(provider, entry, show_provider):
     if u:
         fmt = lambda v: v if v is not None else "ukjent"
         st.caption(f"Tokens: input {fmt(u.get('input'))} · output {fmt(u.get('output'))} · modell {u.get('model') or '–'}")
+        if u.get("fallback"):
+            st.caption("Reservemodell brukt. Feilet først: " + "; ".join(u["fallback"]))
     if entry.get("error_detail"):
         st.warning(entry["error_detail"])
 
@@ -519,7 +546,7 @@ left, right = st.columns([4, 1])
 with left:
     provider_mode = st.radio(
         "Velg AI-modell", ["Groq", "Gemini", "Sammenlign begge"],
-        horizontal=True, key="provider_mode"
+        index=2, horizontal=True, key="provider_mode"
     )
 with right:
     st.write("")
