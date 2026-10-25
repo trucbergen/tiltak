@@ -24,6 +24,9 @@ MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
 PAGE_SIZE = 5
 MAX_CONTEXT_CHARS = 1900
+GEMINI_MAX_OUTPUT_TOKENS = 900
+GROQ_MAX_OUTPUT_TOKENS = 2000
+GEMINI_RETRY_DELAYS = (2, 5)  # Sekunder mellom forsok ved 503/429
 STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
 st.markdown("""<style>
@@ -252,9 +255,13 @@ def generate(provider, question, docs, history):
         messages += [{"role": m["role"], "content": m["content"][:1200]} for m in recent]
         messages.append({"role": "user", "content": user_prompt})
         result = groq_client(key).chat.completions.create(
-            model=GROQ_MODEL, messages=messages, temperature=0.1, max_tokens=2000
+            model=GROQ_MODEL, messages=messages, temperature=0.1, max_tokens=GROQ_MAX_OUTPUT_TOKENS
         )
-        return (result.choices[0].message.content or "Ingen svar generert.").strip()
+        return (
+            (result.choices[0].message.content or "Ingen svar generert.").strip(),
+            {"input": getattr(getattr(result, "usage", None), "prompt_tokens", None),
+             "output": getattr(getattr(result, "usage", None), "completion_tokens", None)},
+        )
     key = secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY mangler i Streamlit Secrets")
@@ -264,13 +271,34 @@ def generate(provider, question, docs, history):
         role = "user" if m["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"][:1200])]))
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)]))
-    result = gemini_client(key).models.generate_content(
-        model=GEMINI_MODEL, contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT, temperature=0.1, max_output_tokens=900
-        ),
-    )
-    return (result.text or "Ingen svar generert.").strip()
+    # Kun midlertidig kapasitetsfeil (503) eller rate limit (429) forsokes igjen.
+    # Andre feil, for eksempel ugyldig API-nokkel, returneres umiddelbart.
+    for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
+        try:
+            result = gemini_client(key).models.generate_content(
+                model=GEMINI_MODEL, contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.1,
+                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                ),
+            )
+            usage = getattr(result, "usage_metadata", None)
+            return (
+                (result.text or "Ingen svar generert.").strip(),
+                {"input": getattr(usage, "prompt_token_count", None),
+                 "output": getattr(usage, "candidates_token_count", None)},
+            )
+        except Exception as exc:
+            status = getattr(exc, "code", None)
+            if status is None:
+                status = getattr(exc, "status_code", None)
+            if status is None:
+                match = re.search(r"\b(429|503)\b", str(exc))
+                status = int(match.group(1)) if match else None
+            if str(status) not in ("429", "503") or attempt >= len(GEMINI_RETRY_DELAYS):
+                raise
+            time.sleep(GEMINI_RETRY_DELAYS[attempt])
 
 
 def render_documents(docs, total, key):
@@ -317,6 +345,9 @@ def render_assistant(message, idx):
                 st.markdown(entry.get("text", "Ingen svar."))
                 if entry.get("seconds") is not None:
                     st.caption(f"Svartid: {entry['seconds']:.1f} sekunder")
+                if entry.get("usage"):
+                    u = entry["usage"]
+                    st.caption(f"Tokens: input {u.get('input') if u.get('input') is not None else 'ukjent'} · output {u.get('output') if u.get('output') is not None else 'ukjent'}")
                 if entry.get("error_detail"):
                     st.warning(entry["error_detail"])
     else:
@@ -324,6 +355,9 @@ def render_assistant(message, idx):
             st.markdown(entry.get("text", "Ingen svar."))
             if entry.get("seconds") is not None:
                 st.caption(f"{provider} · Svartid: {entry['seconds']:.1f} sekunder")
+            if entry.get("usage"):
+                u = entry["usage"]
+                st.caption(f"Tokens: input {u.get('input') if u.get('input') is not None else 'ukjent'} · output {u.get('output') if u.get('output') is not None else 'ukjent'}")
             if entry.get("error_detail"):
                 st.warning(entry["error_detail"])
     docs = message.get("sources") or []
@@ -398,16 +432,23 @@ if question and question.strip():
                 t0 = time.perf_counter()
                 with st.spinner(f"{provider} lager svar ..."):
                     try:
-                        answer = generate(provider, question, docs[:AI_SOURCES], history)
+                        answer, usage = generate(provider, question, docs[:AI_SOURCES], history)
                     except Exception as exc:
-                        answer = f"{provider} kunne ikke svare nå ({type(exc).__name__}). Dokumentene er fortsatt tilgjengelige nedenfor."
-                        error_detail = safe_api_error(exc)
+                        usage = None
+                        status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                        if provider == "Gemini" and (str(status) in ("503", "429") or re.search(r"\b(503|429)\b", str(exc))):
+                            answer = "Gemini er midlertidig overbelastet. Prov igjen senere, eller velg Groq. Dokumenttreffene er tilgjengelige nedenfor."
+                            error_detail = None
+                        else:
+                            answer = f"{provider} kunne ikke svare nå ({type(exc).__name__}). Dokumentene er fortsatt tilgjengelige nedenfor."
+                            error_detail = safe_api_error(exc)
                     else:
                         error_detail = None
                 answer_data[provider] = {
                     "text": answer,
                     "seconds": time.perf_counter() - t0,
                     "error_detail": error_detail,
+                    "usage": usage,
                 }
         message = {"role": "assistant", "answers": answer_data, "sources": docs,
                    "total": total, "search_mode": search_mode}
