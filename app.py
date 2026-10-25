@@ -268,6 +268,51 @@ TRUNCATED_TEXT = (
     "(finish_reason={reason}). Prøv igjen, eller still et mer konkret spørsmål."
 )
 
+# Gjentas nederst i brukermeldingen: modeller folger sist leste instruks best.
+FORMAT_REMINDER = (
+    "\n\nFORMATKRAV: Svar med korte overskrifter og punktlister. "
+    "Ingen tabeller. Ikke fyll inn felter som kildene ikke dokumenterer. "
+    "Ikke oppgi kontaktdetaljer; vis til kildene."
+)
+
+
+def tables_to_bullets(text):
+    """Gjor Markdown-tabeller om til punktlister (forste kolonne = navn).
+
+    Deterministisk sikring for modeller som ignorerer formatkravet.
+    """
+    lines = text.splitlines()
+
+    def is_row(s):
+        s = s.strip()
+        return len(s) > 1 and s.startswith("|") and s.endswith("|")
+
+    def is_sep(s):
+        s = s.strip()
+        return "--" in s and set(s) <= set("|:- ")
+
+    def cells(s):
+        return [re.sub(r"<br\s*/?>", " ", c).strip() for c in s.strip().strip("|").split("|")]
+
+    out, i = [], 0
+    while i < len(lines):
+        if i + 1 < len(lines) and is_row(lines[i]) and is_sep(lines[i + 1]):
+            header = cells(lines[i])
+            i += 2
+            while i < len(lines) and is_row(lines[i]):
+                row = cells(lines[i])
+                if any(row):
+                    out.append(f"- **{row[0] or 'Uten navn'}**")
+                    for h, c in zip(header[1:], row[1:]):
+                        if c and not c.lower().startswith(("ingen konkrete", "ikke dokumentert", "–", "-")):
+                            out.append(f"    - **{h}:** {c}")
+                i += 1
+            out.append("")
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out).strip()
+
 
 def generate_groq(user_prompt, recent):
     key = secret("GROQ_API_KEY")
@@ -338,7 +383,8 @@ def generate_gemini(user_prompt, recent):
 
 
 def generate(provider, question, docs, history):
-    user_prompt = f"SPØRSMÅL: {question}\n\nKILDER (bruk bare disse):\n{context(docs)}"
+    user_prompt = (f"SPØRSMÅL: {question}\n\nKILDER (bruk bare disse):\n{context(docs)}"
+                   + FORMAT_REMINDER)
     recent = [m for m in history[-4:] if m.get("role") in ("user", "assistant") and m.get("content")]
     if provider == "Groq":
         return generate_groq(user_prompt, recent)
@@ -479,6 +525,7 @@ if question and question.strip():
                 with st.spinner(f"{provider} lager svar ..."):
                     try:
                         answer, usage = generate(provider, question, docs[:AI_SOURCES], history)
+                        answer = tables_to_bullets(answer)
                     except Exception as exc:
                         error_detail = safe_api_error(exc)
                         if is_transient(exc):
