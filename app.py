@@ -14,7 +14,7 @@ from google.genai import types
 
 st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="wide")
 DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot_08d_TEST.db"
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.8-flash"
 PAGE_SIZE = 5
 AI_SOURCES = 6
 MAX_CANDIDATES = 15
