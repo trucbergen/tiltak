@@ -17,7 +17,7 @@ import streamlit as st
 st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="centered")
 # Databasen ligger i samme mappe som app.py (lokalt og i Streamlit Cloud).
 DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 # Gemini-modeller i prioritert rekkefolge. Ved 429/503/504 provs neste modell.
 GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash")
 TRANSIENT_STATUS = ("429", "503", "504")
@@ -354,12 +354,14 @@ def generate_groq(user_prompt, recent):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += [{"role": m["role"], "content": m["content"][:1200]} for m in recent]
     messages.append({"role": "user", "content": user_prompt})
+    # gpt-oss resonnerer for den svarer; begrens resonneringen og ikke
+    # returner den, slik at tokenbudsjettet gar til selve svaret.
+    # Andre modeller (f.eks. Llama) tar ikke imot disse parameterne.
+    extra = ({"reasoning_effort": GROQ_REASONING_EFFORT, "include_reasoning": False}
+             if GROQ_MODEL.startswith("openai/gpt-oss") else {})
     result = groq_client(key).chat.completions.create(
         model=GROQ_MODEL, messages=messages, temperature=0.1,
-        max_tokens=GROQ_MAX_OUTPUT_TOKENS,
-        # gpt-oss resonnerer for den svarer; begrens resonneringen og
-        # ikke returner den, slik at tokenbudsjettet gar til selve svaret.
-        extra_body={"reasoning_effort": GROQ_REASONING_EFFORT, "include_reasoning": False},
+        max_tokens=GROQ_MAX_OUTPUT_TOKENS, extra_body=extra,
     )
     choice = result.choices[0]
     text = (choice.message.content or "").strip()
