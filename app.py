@@ -263,6 +263,8 @@ if question:
                 #render_docs(results,total,str(len(st.session_state.messages)))
                 url = str(url or "").strip()
 
+url = str(doc.get("url") or "").strip()
+
 if url.startswith(("https://", "http://")):
     st.link_button(
         "Åpne originaldokument",
