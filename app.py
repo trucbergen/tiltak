@@ -26,8 +26,7 @@ PAGE_SIZE = 5
 MAX_CONTEXT_CHARS = 1900
 GEMINI_MAX_OUTPUT_TOKENS = 900
 GROQ_MAX_OUTPUT_TOKENS = 2000
-GEMINI_INITIAL_WAIT = 3  # Vent litt for Gemini alene (sekunder)
-GEMINI_RETRY_DELAYS = (3, 6)  # Sekunder mellom forsok ved 503/429
+GEMINI_RETRY_DELAYS = (2,)  # Ett nytt forsok ved 429/503/504
 STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
 st.markdown("""<style>
@@ -57,7 +56,7 @@ def gemini_client(key):
     from google import genai
     from google.genai import types
     # Kortere nettverks-timeout enn SDK-standard, i millisekunder.
-    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=40000))
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=20000))
 
 
 def safe_api_error(exc):
@@ -235,6 +234,12 @@ SYSTEM_PROMPT = (
     "bruk én punktliste per tilbud med navn, beskrivelse, "
     "målgruppe, eventuelle vilkår og kilde. "
     "Ta bare med felter som kildene faktisk dokumenterer. "
+    "KONTAKTDETALJER: "
+    "Ikke oppgi telefonnummer, e-postadresser, postadresser, gateadresser "
+    "eller apningstider i svarene, selv om de finnes i kildene. "
+    "Fokuser pa hva tjenesten tilbyr, hvem den gjelder for, og dokumenterte vilkar. "
+    "Hvis brukeren ber om kontaktinformasjon, vis til originaldokumentet "
+    "via kildehenvisning i stedet for a gjengi detaljene. "
     "Bruk korte avsnitt og unngå gjentakelser. "
 
     "SVARLENGDE: "
@@ -272,7 +277,7 @@ def generate(provider, question, docs, history):
         role = "user" if m["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"][:1200])]))
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)]))
-    # Kun midlertidig kapasitetsfeil (503) eller rate limit (429) forsokes igjen.
+    # Midlertidige API-feil (429/503/504) forsokes igjen en gang.
     # Andre feil, for eksempel ugyldig API-nokkel, returneres umiddelbart.
     for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
         try:
@@ -297,7 +302,7 @@ def generate(provider, question, docs, history):
             if status is None:
                 match = re.search(r"\b(429|503)\b", str(exc))
                 status = int(match.group(1)) if match else None
-            if str(status) not in ("429", "503") or attempt >= len(GEMINI_RETRY_DELAYS):
+            if str(status) not in ("429", "503", "504") or attempt >= len(GEMINI_RETRY_DELAYS):
                 raise
             time.sleep(GEMINI_RETRY_DELAYS[attempt])
 
@@ -433,16 +438,12 @@ if question and question.strip():
                 t0 = time.perf_counter()
                 with st.spinner(f"{provider} lager svar ..."):
                     try:
-                        # Ved Gemini alene: vent kort, slik at kallet ikke sendes umiddelbart.
-                        # I sammenligningsmodus kjores Groq forst, sa ekstra venting er unodvendig.
-                        if provider == "Gemini" and provider_mode == "Gemini":
-                            time.sleep(GEMINI_INITIAL_WAIT)
                         answer, usage = generate(provider, question, docs[:AI_SOURCES], history)
                     except Exception as exc:
                         usage = None
                         status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-                        if provider == "Gemini" and (str(status) in ("503", "429") or re.search(r"\b(503|429)\b", str(exc))):
-                            answer = "Gemini er midlertidig overbelastet. Prov igjen senere, eller velg Groq. Dokumenttreffene er tilgjengelige nedenfor."
+                        if provider == "Gemini" and (str(status) in ("503", "429", "504") or re.search(r"\b(503|429|504)\b", str(exc))):
+                            answer = "Gemini er midlertidig utilgjengelig eller bruker for lang tid. Prov igjen senere, eller velg Groq. Dokumenttreffene er tilgjengelige nedenfor."
                             error_detail = None
                         else:
                             answer = f"{provider} kunne ikke svare nå ({type(exc).__name__}). Dokumentene er fortsatt tilgjengelige nedenfor."
