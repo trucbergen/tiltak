@@ -314,6 +314,33 @@ def tables_to_bullets(text):
     return "\n".join(out).strip()
 
 
+def normalize_markdown(text):
+    """Gi Groq- og Gemini-svar samme utseende i Streamlit.
+
+    - Tabeller blir punktlister.
+    - <br> blir linjeskift.
+    - Linjer som starter med «•» blir ekte Markdown-underpunkter.
+    - «Kontakt: se originaldokument [n]» blir «Kilde: [n]».
+    - Overskrifter dempes til maks nivå 4 (#### ) så de ikke blir for store.
+    """
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = tables_to_bullets(text)
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("•", "◦", "▪")):
+            line = "    - " + stripped.lstrip("•◦▪ ").strip()
+        line = re.sub(
+            r"(?i)kontakt(?:informasjon)?\s*:\s*se (?:original)?dokument(?:et)?\s*(\[\d+\])\.?",
+            r"Kilde: \1", line,
+        )
+        heading = re.match(r"^(#{1,3})\s+(.*)", line)
+        if heading:
+            line = "#### " + heading.group(2)
+        out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
 def generate_groq(user_prompt, recent):
     key = secret("GROQ_API_KEY")
     if not key:
@@ -525,7 +552,7 @@ if question and question.strip():
                 with st.spinner(f"{provider} lager svar ..."):
                     try:
                         answer, usage = generate(provider, question, docs[:AI_SOURCES], history)
-                        answer = tables_to_bullets(answer)
+                        answer = normalize_markdown(answer)
                     except Exception as exc:
                         error_detail = safe_api_error(exc)
                         if is_transient(exc):
