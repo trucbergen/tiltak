@@ -165,7 +165,7 @@ def render_docs(docs, total, key):
             st.caption(f"Tema: {d.get('tema') or '–'} · Målgruppe: {d.get('malgruppe') or '–'}")
             url = str(d.get("url") or "")
             if url.startswith(("https://", "http://")):
-                st.link_button("Åpne originaldokument",url,key=f"url_{key}_{i}")
+                st.link_button("Åpne originaldokument", url)
     a,b,c = st.columns([1,2,1])
     with a:
         if st.button("← Forrige",disabled=page<=1,key=f"prev_{key}"):
@@ -260,20 +260,10 @@ if question:
         st.markdown(answer)
         if results:
             with st.expander(f"📄 Vis dokumenter ({total} treff)"):
-                #render_docs(results,total,str(len(st.session_state.messages)))
-                url = str(url or "").strip()
-
-url = str(doc.get("url") or "").strip()
-
-if url.startswith(("https://", "http://")):
-    st.link_button(
-        "Åpne originaldokument",
-        url,
-        key=f"url_{key}_{i}"
-    )
-else:
-    st.caption("Originaldokument mangler gyldig lenke")
-                
-    st.session_state.messages.append({"role":"assistant","content":answer,"sources":results,"total":total,"mode":search_mode})
+                render_docs(results, total, str(len(st.session_state.messages)))
+    st.session_state.messages.append({
+        "role": "assistant", "content": answer, "sources": results,
+        "total": total, "mode": search_mode
+    })
 
 st.caption("AI-svar bygger på et begrenset utvalg dokumentutdrag. Kontroller alltid originalkildene.")
