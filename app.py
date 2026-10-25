@@ -26,7 +26,8 @@ PAGE_SIZE = 5
 MAX_CONTEXT_CHARS = 1900
 GEMINI_MAX_OUTPUT_TOKENS = 900
 GROQ_MAX_OUTPUT_TOKENS = 2000
-GEMINI_RETRY_DELAYS = (2, 5)  # Sekunder mellom forsok ved 503/429
+GEMINI_INITIAL_WAIT = 3  # Vent litt for Gemini alene (sekunder)
+GEMINI_RETRY_DELAYS = (3, 6)  # Sekunder mellom forsok ved 503/429
 STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
 st.markdown("""<style>
@@ -432,6 +433,10 @@ if question and question.strip():
                 t0 = time.perf_counter()
                 with st.spinner(f"{provider} lager svar ..."):
                     try:
+                        # Ved Gemini alene: vent kort, slik at kallet ikke sendes umiddelbart.
+                        # I sammenligningsmodus kjores Groq forst, sa ekstra venting er unodvendig.
+                        if provider == "Gemini" and provider_mode == "Gemini":
+                            time.sleep(GEMINI_INITIAL_WAIT)
                         answer, usage = generate(provider, question, docs[:AI_SOURCES], history)
                     except Exception as exc:
                         usage = None
