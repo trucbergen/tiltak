@@ -19,7 +19,8 @@ st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", la
 DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 # Gemini-modeller i prioritert rekkefolge. Ved 429/503/504 provs neste modell.
-GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash")
+# Flash gir bedre relevans enn Lite; Lite er billigere reserve ved kvotefeil.
+GEMINI_MODELS = ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
 TRANSIENT_STATUS = ("429", "503", "504")
 AI_SOURCES = 6
 MAX_CANDIDATES = 15
@@ -327,22 +328,27 @@ def normalize_markdown(text):
     - <br> blir linjeskift.
     - Linjer som starter med «•» blir ekte Markdown-underpunkter.
     - «Kontakt: se originaldokument [n]» blir «Kilde: [n]».
-    - Overskrifter dempes til maks nivå 4 (#### ) så de ikke blir for store.
+    - Overskrifter blir fet tekst, slik at begge modeller ser like ut.
     """
     text = re.sub(r"<br\s*/?>", "\n", text)
     text = tables_to_bullets(text)
     out = []
     for line in text.splitlines():
         stripped = line.strip()
+        # Setext-overskrift: linje med === eller --- under en tekstlinje.
+        if re.fullmatch(r"(=+|-{3,})", stripped) and out and out[-1].strip() \
+                and not out[-1].lstrip().startswith(("-", "*", "#", "|")):
+            out[-1] = "**" + out[-1].strip().strip("*") + "**"
+            continue
         if stripped.startswith(("•", "◦", "▪")):
             line = "    - " + stripped.lstrip("•◦▪ ").strip()
         line = re.sub(
             r"(?i)kontakt(?:informasjon)?\s*:\s*se (?:original)?dokument(?:et)?\s*(\[\d+\])\.?",
             r"Kilde: \1", line,
         )
-        heading = re.match(r"^(#{1,3})\s+(.*)", line)
+        heading = re.match(r"^\s*(#{1,3})\s+(.*)", line)
         if heading:
-            line = "#### " + heading.group(2)
+            line = "**" + heading.group(2).strip().strip("*") + "**"
         out.append(line)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
