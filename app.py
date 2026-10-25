@@ -25,7 +25,8 @@ MAX_LIST_RESULTS = 250
 PAGE_SIZE = 5
 MAX_CONTEXT_CHARS = 1900
 GEMINI_MAX_OUTPUT_TOKENS = 900
-GROQ_MAX_OUTPUT_TOKENS = 2000
+GROQ_MAX_OUTPUT_TOKENS = 3000
+GROQ_REASONING_EFFORT = "low"  # gpt-oss: mer plass til synlig svar
 GEMINI_RETRY_DELAYS = (2,)  # Ett nytt forsok ved 429/503/504
 STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
@@ -261,10 +262,18 @@ def generate(provider, question, docs, history):
         messages += [{"role": m["role"], "content": m["content"][:1200]} for m in recent]
         messages.append({"role": "user", "content": user_prompt})
         result = groq_client(key).chat.completions.create(
-            model=GROQ_MODEL, messages=messages, temperature=0.1, max_tokens=GROQ_MAX_OUTPUT_TOKENS
+            model=GROQ_MODEL, messages=messages, temperature=0.1,
+            max_tokens=GROQ_MAX_OUTPUT_TOKENS, reasoning_effort=GROQ_REASONING_EFFORT
         )
+        answer = (result.choices[0].message.content or "").strip()
+        finish_reason = getattr(result.choices[0], "finish_reason", None)
+        if not answer:
+            if finish_reason == "length":
+                answer = "Groq brukte hele tokenbudsjettet uten å fullføre et synlig svar. Prøv et mer spesifikt spørsmål."
+            else:
+                answer = "Groq returnerte et tomt svar. Prøv igjen eller velg Gemini."
         return (
-            (result.choices[0].message.content or "Ingen svar generert.").strip(),
+            answer,
             {"input": getattr(getattr(result, "usage", None), "prompt_tokens", None),
              "output": getattr(getattr(result, "usage", None), "completion_tokens", None)},
         )
@@ -300,7 +309,7 @@ def generate(provider, question, docs, history):
             if status is None:
                 status = getattr(exc, "status_code", None)
             if status is None:
-                match = re.search(r"\b(429|503)\b", str(exc))
+                match = re.search(r"\b(429|503|504)\b", str(exc))
                 status = int(match.group(1)) if match else None
             if str(status) not in ("429", "503", "504") or attempt >= len(GEMINI_RETRY_DELAYS):
                 raise
@@ -370,7 +379,7 @@ def render_assistant(message, idx):
     if docs:
         total = message.get("total", len(docs))
         mode = message.get("search_mode", "AND")
-        st.caption(f"SQLite FTS5: {total} treff ({mode}-søk). Begge modeller bruker de samme {min(AI_SOURCES, len(docs))} øverste dokumentene.")
+        st.caption(f"SQLite FTS5: {total} treff ({mode}-søk). AI-modellene bruker de samme {min(AI_SOURCES, len(docs))} øverste dokumentene.")
         if mode == "OR":
             st.caption("Utvidet OR-søk kan inneholde svakt relevante dokumenter. Kontroller originalkildene.")
         with st.expander(f"📄 Vis dokumenter ({total} treff)"):
