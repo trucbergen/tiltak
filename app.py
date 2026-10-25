@@ -54,6 +54,27 @@ def gemini_client(key):
     return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=40000))
 
 
+def safe_api_error(exc):
+    """Vis HTTP-status og API-melding uten aa eksponere API-nokler."""
+    status = getattr(exc, "code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+
+    raw = str(exc)
+    # Ikke vis hele URL-er, som kan inneholde key=... .
+    raw = re.sub(r"https?://[^\s\"']+", "[URL skjult]", raw)
+    raw = re.sub(r"(?i)(key|api_key|x-goog-api-key)\s*[:=]\s*['\"]?[^\s,'\"}]+", r"\1=[SKJULT]", raw)
+    raw = re.sub(r"AIza[0-9A-Za-z_-]+", "[API-NOKKEL SKJULT]", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()[:700]
+    if status is None:
+        match = re.search(r"\b(400|401|403|404|408|429|500|502|503|504)\b", raw)
+        status = match.group(1) if match else "ukjent"
+    return f"{type(exc).__name__} · HTTP {status}: {raw}"
+
+
 def connect():
     uri = f"file:{quote(str(DB_PATH.resolve()), safe='/:')}?mode=ro"
     return sqlite3.connect(uri, uri=True)
@@ -204,11 +225,15 @@ def render_assistant(message, idx):
                 st.markdown(entry.get("text", "Ingen svar."))
                 if entry.get("seconds") is not None:
                     st.caption(f"Svartid: {entry['seconds']:.1f} sekunder")
+                if entry.get("error_detail"):
+                    st.warning(entry["error_detail"])
     else:
         for provider, entry in answers.items():
             st.markdown(entry.get("text", "Ingen svar."))
             if entry.get("seconds") is not None:
                 st.caption(f"{provider} · Svartid: {entry['seconds']:.1f} sekunder")
+            if entry.get("error_detail"):
+                st.warning(entry["error_detail"])
     docs = message.get("sources") or []
     if docs:
         total = message.get("total", len(docs))
@@ -283,9 +308,15 @@ if question and question.strip():
                     try:
                         answer = generate(provider, question, docs[:AI_SOURCES], history)
                     except Exception as exc:
-                        # Unnga aa vise unodvendige detaljer fra leverandorens API-svar.
                         answer = f"{provider} kunne ikke svare nå ({type(exc).__name__}). Dokumentene er fortsatt tilgjengelige nedenfor."
-                answer_data[provider] = {"text": answer, "seconds": time.perf_counter() - t0}
+                        error_detail = safe_api_error(exc)
+                    else:
+                        error_detail = None
+                answer_data[provider] = {
+                    "text": answer,
+                    "seconds": time.perf_counter() - t0,
+                    "error_detail": error_detail,
+                }
         message = {"role": "assistant", "answers": answer_data, "sources": docs,
                    "total": total, "search_mode": search_mode}
         render_assistant(message, len(st.session_state.messages))
