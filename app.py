@@ -16,7 +16,7 @@ import streamlit as st
 st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="centered")
 DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot_08d_TEST.db"
 GROQ_MODEL = "openai/gpt-oss-20b"
-GEMINI_MODEL = "gemini-3.8-flash"  # Modellen anbefalt i API-feilmeldingen; kan endres.
+GEMINI_MODEL = "gemini-3.1-flash-lite"  # Modellen anbefalt i API-feilmeldingen; kan endres.
 AI_SOURCES = 6
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
