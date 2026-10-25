@@ -140,14 +140,15 @@ def relevant_or(c, question, docs):
         contents=json.dumps({"sporsmal":question,"dokumenter":candidates},ensure_ascii=False),
         config=types.GenerateContentConfig(system_instruction=instructions, temperature=0,
             response_mime_type="application/json", max_output_tokens=250))
-    #ids = json.loads(resp.text or "{}").get("relevante", [])
     try:
-    data = json.loads(resp.text or "{}")
-    ids = data.get("relevante", [])
-except (json.JSONDecodeError, TypeError, AttributeError):
-    return []
+        data = json.loads(resp.text or "{}")
+        ids = data.get("relevante", [])
+        if not isinstance(ids, list):
+            return []
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return []
     selected = {x for x in ids if type(x) is int and 1 <= x <= len(candidates)}
-    return [d for i,d in enumerate(docs[:MAX_CANDIDATES],1) if i in selected]
+    return [d for i, d in enumerate(docs[:MAX_CANDIDATES], 1) if i in selected]
 
 
 def render_docs(docs, total, key):
