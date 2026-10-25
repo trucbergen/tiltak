@@ -5,6 +5,7 @@ Secrets: GROQ_API_KEY og/eller GEMINI_API_KEY.
 from __future__ import annotations
 
 import html
+import os
 import re
 import sqlite3
 import time
@@ -14,7 +15,8 @@ from urllib.parse import quote
 import streamlit as st
 
 st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="centered")
-DB_PATH = Path(__file__).resolve().parent / "bergen_chatbot_08d_TEST.db"
+# Databasen ligger i samme mappe som app.py (lokalt og i Streamlit Cloud).
+DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
 GROQ_MODEL = "openai/gpt-oss-20b"
 GEMINI_MODEL = "gemini-3.1-flash-lite"  # Modellen anbefalt i API-feilmeldingen; kan endres.
 AI_SOURCES = 6
@@ -86,6 +88,10 @@ def db_count(path, mtime):
         tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
         if not {"documents", "documents_fts_full"}.issubset(tables):
             raise RuntimeError("Databasen mangler documents eller documents_fts_full")
+        required_cols = {"doc_id", "tittel", "url", "oppsummering", "tekstutdrag", "tema", "malgruppe", "informasjonstype", "kommune", "dokumentdato"}
+        cols = {r[1] for r in con.execute("PRAGMA table_info(documents)")}
+        if missing := required_cols - cols:
+            raise RuntimeError("Databasen mangler kolonner: " + ", ".join(sorted(missing)))
         return con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
 
@@ -187,7 +193,7 @@ def context(docs):
 
 SYSTEM_PROMPT = (
     "Du er en presis, nøktern og hjelpsom norsk dokumentassistent "
-    "for kommunale tjenester, tiltak og dokumenter fra Bergen kommune. "
+    "for kommunale tjenester, tiltak og dokumenter fra offentlige kilder. "
 
     "KILDEBRUK: "
     "Bruk KUN dokumentene som er oppgitt i siste brukermelding. "
@@ -331,9 +337,9 @@ def render_assistant(message, idx):
             render_documents(docs, total, str(idx))
 
 
-st.markdown('<div class="hero"><h1>🔎 Kommunal dokumentassistent</h1><p>Spør om tjenester, tiltak og dokumenter fra Bergen kommune.</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🔎 Kommunal dokumentassistent</h1><p>Spør om tjenester, tiltak og dokumenter fra kommuner og offentlige kilder.</p></div>', unsafe_allow_html=True)
 if not DB_PATH.is_file():
-    st.error(f"Finner ikke databasen: {DB_PATH.name}. Legg SQLite-filen i samme GitHub-mappe som app.py.")
+    st.error(f"Finner ikke databasen: {DB_PATH.name}. Legg bergen_db.db i samme mappe som app.py.")
     st.stop()
 try:
     count = db_count(str(DB_PATH), DB_PATH.stat().st_mtime_ns)
