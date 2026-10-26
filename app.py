@@ -1,8 +1,9 @@
 """Kommunal dokumentassistent – ChatGPT-lignende Streamlit-grensesnitt.
 Hybrid sok: SQLite FTS5 (nokkelord) + semantisk sok (nomic-embed-text-vektorer
 fra bergen_vec.db), slatt sammen med Reciprocal Rank Fusion.
-Valgfri Groq/Gemini eller sammenligning av begge.
-Secrets: GROQ_API_KEY og/eller GEMINI_API_KEY.
+VANLIG VISNING for testere: bare Groq, alltid hybrid sok, ingen tekniske detaljer.
+(Utviklerversjonen med modellvalg, sokemetode og diagnose ligger i app_utvikler.py.)
+Secrets: GROQ_API_KEY.
 """
 from __future__ import annotations
 
@@ -44,25 +45,15 @@ SEM_MIN_SIMILARITY = 0.50   # absolutt gulv (sikkerhetsnett)
 SEM_RELATIVE_MARGIN = 0.03  # hoyere = flere treff, lavere = faerre
 SEM_MAX_DOCS = 15           # maks antall semantiske dokumenttreff
 RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
-SEARCH_MODES = ["Hybrid", "Nøkkelord", "Semantisk"]
+SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
-# Gemini-modeller i prioritert rekkefolge. Ved 429/503/504 provs neste modell.
-# Testperiode: bare Flash-Lite (billig, gratisnivaa). Flash kan legges til forst
-# i listen senere: "gemini-3.5-flash".
-GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-# Forstevalget far kort timeout, slik at en treg/overbelastet modell ikke
-# holder brukeren 20 sekunder for reserven slipper til (millisekunder).
-GEMINI_FIRST_TIMEOUT_MS = 15000
-GEMINI_FALLBACK_TIMEOUT_MS = 20000
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 6
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
 PAGE_SIZE = 5
 MAX_CONTEXT_CHARS = 1900
-# Begge leverandorer kan bruke tokens pa intern resonnering for selve svaret,
-# sa grensene ma ha god margin.
-GEMINI_MAX_OUTPUT_TOKENS = 3000
+# gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
 GROQ_MAX_OUTPUT_TOKENS = 4000
 GROQ_REASONING_EFFORT = "low"  # gpt-oss: low / medium / high
 STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
@@ -89,14 +80,6 @@ def groq_client(key):
     return Groq(api_key=key, timeout=40.0, max_retries=0)
 
 
-@st.cache_resource(show_spinner=False)
-def gemini_client(key, timeout_ms=GEMINI_FALLBACK_TIMEOUT_MS):
-    from google import genai
-    from google.genai import types
-    # Egen klient per timeout; caches per (nokkel, timeout).
-    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_ms))
-
-
 def error_status(exc):
     """Hent HTTP-status fra et API-unntak som streng, eller None."""
     status = getattr(exc, "code", None)
@@ -118,13 +101,6 @@ def is_timeout(exc):
 
 def is_transient(exc):
     return error_status(exc) in TRANSIENT_STATUS or is_timeout(exc)
-
-
-def short_failure(model, exc):
-    """Kort beskrivelse av et mislykket modellforsok, uten nokler."""
-    if is_timeout(exc):
-        return f"{model}: tidsavbrudd"
-    return f"{model}: HTTP {error_status(exc) or 'ukjent'}"
 
 
 def safe_api_error(exc):
@@ -632,59 +608,11 @@ def generate_groq(user_prompt, recent):
     }
 
 
-def generate_gemini(user_prompt, recent):
-    key = secret("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY mangler i Streamlit Secrets")
-    from google.genai import types
-    contents = []
-    for m in recent:
-        role = "user" if m["role"] == "user" else "model"
-        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m["content"][:1200])]))
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)]))
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        temperature=0.1,
-        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-    )
-    # Midlertidige feil (429/503/504) gjelder ofte bare en modell:
-    # prov neste modell i listen. Andre feil returneres umiddelbart.
-    last_exc = None
-    failures = []
-    for i, model in enumerate(GEMINI_MODELS):
-        timeout_ms = GEMINI_FIRST_TIMEOUT_MS if i == 0 else GEMINI_FALLBACK_TIMEOUT_MS
-        try:
-            result = gemini_client(key, timeout_ms).models.generate_content(
-                model=model, contents=contents, config=config,
-            )
-        except Exception as exc:
-            if not is_transient(exc):
-                raise
-            failures.append(short_failure(model, exc))
-            last_exc = exc
-            continue
-        text = (result.text or "").strip()
-        if not text:
-            candidates = getattr(result, "candidates", None) or []
-            reason = getattr(candidates[0], "finish_reason", "ukjent") if candidates else "ukjent"
-            text = TRUNCATED_TEXT.format(reason=reason)
-        usage = getattr(result, "usage_metadata", None)
-        return text, {
-            "input": getattr(usage, "prompt_token_count", None),
-            "output": getattr(usage, "candidates_token_count", None),
-            "model": model,
-            "fallback": failures,
-        }
-    raise last_exc
-
-
-def generate(provider, question, docs, history):
+def generate(question, docs, history):
     user_prompt = (f"SPØRSMÅL: {question}\n\nKILDER (bruk bare disse):\n{context(docs)}"
                    + FORMAT_REMINDER)
     recent = [m for m in history[-4:] if m.get("role") in ("user", "assistant") and m.get("content")]
-    if provider == "Groq":
-        return generate_groq(user_prompt, recent)
-    return generate_gemini(user_prompt, recent)
+    return generate_groq(user_prompt, recent)
 
 
 def render_documents(docs, total, key):
@@ -696,132 +624,61 @@ def render_documents(docs, total, key):
     st.session_state[state_key] = page
     first = (page - 1) * PAGE_SIZE
     last = min(first + PAGE_SIZE, len(docs))
-    st.caption(f"Viser {first + 1}–{last} av {total} treff · side {page} av {pages}")
     for i, doc in enumerate(docs[first:last], first + 1):
         with st.container(border=True):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
             st.markdown(f"**{i}. {title}**")
             st.caption(f"{doc.get('kommune') or 'Ukjent kommune'} · {doc.get('dokumentdato') or 'Udatert'} · {doc.get('informasjonstype') or 'Ukjent type'}")
             st.write(doc.get("oppsummering") or doc.get("tekstutdrag") or "Ingen beskrivelse")
-            extra = []
-            if doc.get("kilde_sok"):
-                extra.append(f"Funnet av: {doc['kilde_sok']}")
-            if doc.get("sem_score") is not None:
-                extra.append(f"likhet {doc['sem_score']:.2f}")
-            st.caption(f"Tema: {doc.get('tema') or '–'} · Målgruppe: {doc.get('malgruppe') or '–'}"
-                       + ("" if not extra else " · " + " · ".join(extra)))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
-    left, mid, right = st.columns([1, 2, 1])
-    with left:
-        if st.button("← Forrige", disabled=page <= 1, key=f"prev_{key}"):
-            st.session_state[state_key] = page - 1
-            st.rerun()
-    with mid:
-        st.markdown(f"<p style='text-align:center'>Side {page} av {pages}</p>", unsafe_allow_html=True)
-    with right:
-        if st.button("Neste →", disabled=page >= pages, key=f"next_{key}"):
-            st.session_state[state_key] = page + 1
-            st.rerun()
-
-
-def render_answer_meta(provider, entry, show_provider):
-    if entry.get("seconds") is not None:
-        prefix = f"{provider} · " if show_provider else ""
-        st.caption(f"{prefix}Svartid: {entry['seconds']:.1f} sekunder")
-    u = entry.get("usage")
-    if u:
-        fmt = lambda v: v if v is not None else "ukjent"
-        st.caption(f"Tokens: input {fmt(u.get('input'))} · output {fmt(u.get('output'))} · modell {u.get('model') or '–'}")
-        if u.get("fallback"):
-            st.caption("Reservemodell brukt. Feilet først: " + "; ".join(u["fallback"]))
-    if entry.get("error_detail"):
-        st.warning(entry["error_detail"])
+    if pages > 1:
+        left, mid, right = st.columns([1, 2, 1])
+        with left:
+            if st.button("← Forrige", disabled=page <= 1, key=f"prev_{key}"):
+                st.session_state[state_key] = page - 1
+                st.rerun()
+        with mid:
+            st.markdown(f"<p style='text-align:center'>Viser {first + 1}–{last} av {total}</p>",
+                        unsafe_allow_html=True)
+        with right:
+            if st.button("Neste →", disabled=page >= pages, key=f"next_{key}"):
+                st.session_state[state_key] = page + 1
+                st.rerun()
 
 
 def render_assistant(message, idx):
-    answers = message.get("answers", {})
-    if len(answers) == 2:
-        cols = st.columns(2)
-        for col, provider in zip(cols, ("Groq", "Gemini")):
-            with col:
-                st.markdown(f"**{provider}**")
-                entry = answers.get(provider, {})
-                st.markdown(entry.get("text", "Ingen svar."))
-                render_answer_meta(provider, entry, show_provider=False)
-    else:
-        for provider, entry in answers.items():
-            st.markdown(entry.get("text", "Ingen svar."))
-            render_answer_meta(provider, entry, show_provider=True)
+    st.markdown(message.get("content") or "Ingen svar.")
     docs = message.get("sources") or []
     if docs:
+        st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
-        mode = message.get("search_mode", "Nøkkelord · AND")
-        st.caption(f"Søk: {mode} · {total} dokumenter. Modellene bruker de samme {min(AI_SOURCES, len(docs))} øverste.")
-        if "MINST_2" in mode and not mode.startswith("Hybrid"):
-            st.caption("Utvidet søk kan inneholde svakt relevante dokumenter. Kontroller originalkildene.")
-        if message.get("search_note"):
-            st.warning(message["search_note"])
-        with st.expander(f"📄 Vis dokumenter ({total} treff)"):
+        with st.expander(f"📄 Kilder ({total} dokumenter)"):
             render_documents(docs, total, str(idx))
 
 
 st.markdown('<div class="hero"><h1>🔎 Kommunal dokumentassistent</h1><p>Spør om tjenester, tiltak og dokumenter fra kommuner og offentlige kilder.</p></div>', unsafe_allow_html=True)
 if not DB_PATH.is_file():
-    st.error(f"Finner ikke databasen: {DB_PATH.name}. Legg bergen_db.db i samme mappe som app.py.")
+    st.error("Dokumentdatabasen er ikke tilgjengelig. Kontakt den som drifter tjenesten.")
     st.stop()
 try:
-    count = db_count(str(DB_PATH), DB_PATH.stat().st_mtime_ns)
-except (sqlite3.Error, RuntimeError) as exc:
-    st.error(f"Databasefeil: {exc}")
+    db_count(str(DB_PATH), DB_PATH.stat().st_mtime_ns)
+except (sqlite3.Error, RuntimeError):
+    st.error("Dokumentdatabasen kunne ikke åpnes. Kontakt den som drifter tjenesten.")
     st.stop()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-left, right = st.columns([4, 1])
-with left:
-    provider_mode = st.radio(
-        "Velg AI-modell", ["Groq", "Gemini", "Sammenlign begge"],
-        index=2, horizontal=True, key="provider_mode"
-    )
+_, right = st.columns([4, 1])
 with right:
-    st.write("")
     if st.button("Ny samtale", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
-search_method = st.radio(
-    "Søkemetode", SEARCH_MODES, index=0 if vectors_available() else 1,
-    horizontal=True, key="search_method",
-    help="Hybrid = nøkkelord + semantisk (meningslikhet). Brukes for å sammenligne metodene.",
-)
-vec_info = "semantisk indeks: nomic-embed-text" if vectors_available() else "ingen semantisk indeks (bergen_vec.db mangler)"
-st.caption(f"{count:,} dokumenter · SQLite FTS5 · {vec_info}".replace(",", " "))
-
-# Diagnose er kun for utvikler: vises bare med ?debug=1 i URL-en.
-# Den embedder blokkene én og én (lange tekster i én batch tar for mye minne).
-if vectors_available() and st.query_params.get("debug") == "1":
-    with st.expander("🔧 Diagnose: semantisk modell (utvikler)"):
-        st.caption("Sammenligner appens spørsmålsmodell med vektorene Ollama lagde for dokumentene. "
-                   "Cosinus nær 1,00 betyr samme modell. Bruker 5 kontrollblokker, én om gangen.")
-        if st.button("Kjør kontroll"):
-            import numpy as np
-            uri = f"file:{quote(str(VEC_PATH), safe='/:')}?mode=ro"
-            with sqlite3.connect(uri, uri=True) as con:
-                rows = con.execute("SELECT input, v32 FROM verify LIMIT 5").fetchall()
-            try:
-                for prefix in ("", "search_document: "):
-                    cos = []
-                    for text, blob in rows:
-                        ref = np.frombuffer(blob, dtype="<f4")
-                        ref = ref / np.linalg.norm(ref)
-                        cos.append(float(embed_texts([prefix + text])[0] @ ref))
-                    st.write(f"Prefiks «{prefix or '(ingen)'}»: cosinus snitt {np.mean(cos):.4f}, "
-                             f"min {np.min(cos):.4f}")
-            except Exception as exc:
-                st.warning(f"Kontrollen feilet: {type(exc).__name__}: {str(exc)[:250]}")
+if not st.session_state.messages:
+    st.caption("Prøv for eksempel: «Hvilke aktiviteter finnes for barn og unge i Åsane?»")
 
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
@@ -838,45 +695,28 @@ if question and question.strip():
     with st.chat_message("user"):
         st.markdown(question)
     with st.chat_message("assistant"):
-        started = time.perf_counter()
         try:
-            with st.spinner(f"Søker ({search_method.lower()}) ..."):
-                docs, total, search_mode, search_note = run_search(question, search_method)
-        except sqlite3.Error as exc:
-            st.error(f"SQLite-søkefeil: {exc}")
+            with st.spinner("Søker i dokumentene ..."):
+                docs, total, _mode, _note = run_search(question, SEARCH_METHOD)
+        except sqlite3.Error:
+            st.error("Søket feilet. Prøv igjen.")
             st.stop()
-        search_seconds = time.perf_counter() - started
         if not docs:
-            answer_data = {"Søk": {"text": "Ingen dokumenttreff. Det betyr ikke at tilbudet ikke finnes.", "seconds": None}}
+            answer = ("Jeg fant ingen dokumenter som passer til spørsmålet. "
+                      "Det betyr ikke at tilbudet ikke finnes. Prøv gjerne andre ord.")
         else:
-            providers = ["Groq", "Gemini"] if provider_mode == "Sammenlign begge" else [provider_mode]
-            answer_data = {}
-            for provider in providers:
-                t0 = time.perf_counter()
-                usage = None
-                error_detail = None
-                with st.spinner(f"{provider} lager svar ..."):
-                    try:
-                        answer, usage = generate(provider, question, docs[:AI_SOURCES], history)
-                        answer = normalize_markdown(answer)
-                    except Exception as exc:
-                        error_detail = safe_api_error(exc)
-                        if is_transient(exc):
-                            answer = (f"{provider} er midlertidig utilgjengelig eller kvoten er brukt opp. "
-                                      "Prøv igjen senere, eller velg en annen modell. "
-                                      "Dokumenttreffene er tilgjengelige nedenfor.")
-                        else:
-                            answer = f"{provider} kunne ikke svare nå ({type(exc).__name__}). Dokumentene er fortsatt tilgjengelige nedenfor."
-                answer_data[provider] = {
-                    "text": answer,
-                    "seconds": time.perf_counter() - t0,
-                    "error_detail": error_detail,
-                    "usage": usage,
-                }
-        message = {"role": "assistant", "answers": answer_data, "sources": docs,
-                   "total": total, "search_mode": search_mode, "search_note": search_note}
+            with st.spinner("Lager svar ..."):
+                try:
+                    answer, _usage = generate(question, docs[:AI_SOURCES], history)
+                    answer = normalize_markdown(answer)
+                except Exception as exc:
+                    if is_transient(exc):
+                        answer = ("Tjenesten er midlertidig opptatt. Vent et minutt og prøv igjen. "
+                                  "Dokumentene som ble funnet, ligger under Kilder.")
+                    else:
+                        answer = ("Det oppstod en feil da svaret skulle lages. "
+                                  "Dokumentene som ble funnet, ligger under Kilder.")
+        # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
+        message = {"role": "assistant", "content": answer, "sources": docs, "total": total}
         render_assistant(message, len(st.session_state.messages))
-        st.caption(f"Søketid: {search_seconds:.2f} sekunder")
     st.session_state.messages.append(message)
-
-st.caption("AI-svar er basert på begrensede dokumentutdrag. Kontroller alltid originalkildene.")
