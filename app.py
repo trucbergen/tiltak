@@ -35,7 +35,11 @@ EMBED_WORKER = Path(__file__).resolve().parent / "embed_worker.py"
 EMBED_LOAD_TIMEOUT = 180   # sekunder: forste gang lastes modellen ned
 EMBED_QUERY_TIMEOUT = 30
 EMBED_MAX_RESTARTS = 2
-SEM_TOP_CHUNKS = 400   # antall naermeste blokker for de grupperes per dokument
+SEM_TOP_CHUNKS = 400
+# Semantiske treff under denne likheten (cosinus) regnes ikke som treff.
+# Relevante dokumenter ligger typisk paa 0,55-0,80 med nomic-embed-text.
+# Juster ved behov: hoyere = faerre, mer presise treff.
+SEM_MIN_SIMILARITY = 0.50   # antall naermeste blokker for de grupperes per dokument
 RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
 SEARCH_MODES = ["Hybrid", "Nøkkelord", "Semantisk"]
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
@@ -355,6 +359,8 @@ def semantic_doc_ranking(question, limit=MAX_LIST_RESULTS):
     top = top[np.argsort(-sims[top])]
     best = {}
     for i in top:
+        if sims[i] < SEM_MIN_SIMILARITY:
+            break  # sortert synkende: resten er under grensen
         d = int(doc_ids[i])
         if d not in best:
             best[d] = float(sims[i])
@@ -379,12 +385,18 @@ def fetch_documents(doc_ids):
 
 
 def rrf_merge(*rankings, k=RRF_K):
-    """Reciprocal Rank Fusion: summen av 1/(k + rang) over alle lister."""
-    scores = {}
-    for ranking in rankings:
+    """Reciprocal Rank Fusion: summen av 1/(k + rang) over alle lister.
+
+    Ved lik score vinner dokumentet med best rang i den FORSTE listen
+    (noekkelord), slik at eksakte treff gaar foran rene meningstreff.
+    """
+    scores, first_rank = {}, {}
+    for li, ranking in enumerate(rankings):
         for rank, doc_id in enumerate(ranking, 1):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-    return sorted(scores, key=lambda d: (-scores[d], d))
+            if li == 0:
+                first_rank.setdefault(doc_id, rank)
+    return sorted(scores, key=lambda d: (-round(scores[d], 12), first_rank.get(d, 10**9), d))
 
 
 def run_search(question, method):
@@ -405,7 +417,7 @@ def run_search(question, method):
         docs = fetch_documents(sem_ids)
         for d in docs:
             d["sem_score"] = sem_score.get(d["doc_id"])
-        return docs, len(docs), "Semantisk", None
+        return docs, len(docs), f"Semantisk (likhet ≥ {SEM_MIN_SIMILARITY:.2f})", None
     fts_docs, fts_total, fts_mode = search_documents(question)
     fts_ids = [d["doc_id"] for d in fts_docs]
     merged = rrf_merge(fts_ids, sem_ids)[:MAX_LIST_RESULTS]
@@ -418,7 +430,8 @@ def run_search(question, method):
         d["sem_score"] = sem_score.get(d["doc_id"])
         d["kilde_sok"] = ("begge" if d["doc_id"] in fts_set and d["doc_id"] in sem_score
                           else "nøkkelord" if d["doc_id"] in fts_set else "semantisk")
-    return docs, len(docs), f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk", None
+    return docs, len(docs), (f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk "
+                             f"({len(sem_ids)} med likhet ≥ {SEM_MIN_SIMILARITY:.2f})"), None
 
 
 def context(docs):
