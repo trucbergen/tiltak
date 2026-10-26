@@ -780,23 +780,28 @@ search_method = st.radio(
 vec_info = "semantisk indeks: nomic-embed-text" if vectors_available() else "ingen semantisk indeks (bergen_vec.db mangler)"
 st.caption(f"{count:,} dokumenter · SQLite FTS5 · {vec_info}".replace(",", " "))
 
-if vectors_available():
-    with st.expander("🔧 Diagnose: semantisk modell"):
-        st.caption("Sjekker at spørsmåls-embeddingen (fastembed) gir samme vektorer som Ollama "
-                   "brukte for dokumentene. Cosinus nær 1,00 betyr samme modell.")
+# Diagnose er kun for utvikler: vises bare med ?debug=1 i URL-en.
+# Den embedder blokkene én og én (lange tekster i én batch tar for mye minne).
+if vectors_available() and st.query_params.get("debug") == "1":
+    with st.expander("🔧 Diagnose: semantisk modell (utvikler)"):
+        st.caption("Sammenligner appens spørsmålsmodell med vektorene Ollama lagde for dokumentene. "
+                   "Cosinus nær 1,00 betyr samme modell. Bruker 5 kontrollblokker, én om gangen.")
         if st.button("Kjør kontroll"):
             import numpy as np
             uri = f"file:{quote(str(VEC_PATH), safe='/:')}?mode=ro"
             with sqlite3.connect(uri, uri=True) as con:
-                rows = con.execute("SELECT input, v32 FROM verify").fetchall()
-            ref = np.stack([np.frombuffer(r[1], dtype="<f4") for r in rows])
-            ref /= np.linalg.norm(ref, axis=1, keepdims=True)
-            with st.spinner("Beregner ..."):
+                rows = con.execute("SELECT input, v32 FROM verify LIMIT 5").fetchall()
+            try:
                 for prefix in ("", "search_document: "):
-                    cos = (embed_texts([prefix + r[0] for r in rows]) * ref).sum(axis=1)
-                    st.write(f"Prefiks «{prefix or '(ingen)'}»: cosinus snitt {cos.mean():.4f}, min {cos.min():.4f}")
-if not st.session_state.messages:
-    st.caption("Prøv for eksempel: «Hvilke aktiviteter finnes for barn og unge i Åsane?»")
+                    cos = []
+                    for text, blob in rows:
+                        ref = np.frombuffer(blob, dtype="<f4")
+                        ref = ref / np.linalg.norm(ref)
+                        cos.append(float(embed_texts([prefix + text])[0] @ ref))
+                    st.write(f"Prefiks «{prefix or '(ingen)'}»: cosinus snitt {np.mean(cos):.4f}, "
+                             f"min {np.min(cos):.4f}")
+            except Exception as exc:
+                st.warning(f"Kontrollen feilet: {type(exc).__name__}: {str(exc)[:250]}")
 
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
