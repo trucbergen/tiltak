@@ -2,3 +2,4 @@ streamlit==1.40.0
 groq>=0.13.0
 fastembed>=0.4.0
 numpy
+gspread>=6.0

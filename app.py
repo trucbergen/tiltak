@@ -12,7 +12,11 @@ import json
 import os
 import re
 import sqlite3
+import sys
+import threading
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -616,6 +620,84 @@ def generate(question, docs, history):
     return generate_groq(user_prompt, recent)
 
 
+# ---------------------------------------------------------------------------
+# Logging til Google Sheets (valgfritt: aktiveres naar secrets finnes)
+# Secrets: LOG_SHEET_ID og [gcp_service_account] (JSON-noekkel for tjenestekonto)
+# ---------------------------------------------------------------------------
+LOG_TABS = {
+    "svar": ["tidspunkt", "svar_id", "tester", "økt", "spørsmål", "svar", "antall_kilder",
+             "kilder_topp6", "modell", "svartid_s", "status"],
+    "vurdering": ["tidspunkt", "svar_id", "tester", "økt", "vurdering", "kommentar"],
+}
+CELL_MAX = 45000  # Google Sheets tillater maks 50 000 tegn per celle
+
+
+def logging_enabled():
+    return bool(secret("LOG_SHEET_ID") and secret("gcp_service_account"))
+
+
+@st.cache_resource(show_spinner=False)
+def log_sheet(sheet_id):
+    """Aapner regnearket og lager fanene med overskrifter hvis de mangler.
+    Feil caches ikke, saa neste forsoek proever paa nytt."""
+    import gspread
+    gc = gspread.service_account_from_dict(dict(secret("gcp_service_account")))
+    sh = gc.open_by_key(sheet_id)
+    tabs = {}
+    for name, header in LOG_TABS.items():
+        try:
+            ws = sh.worksheet(name)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=name, rows=1000, cols=len(header))
+        if not ws.row_values(1):
+            ws.append_row(header, value_input_option="RAW")
+        tabs[name] = ws
+    return tabs
+
+
+def log_event(tab, values):
+    """Skriver én rad i bakgrunnen. Feil i loggingen stopper aldri appen."""
+    if not logging_enabled():
+        return
+    try:
+        ws = log_sheet(secret("LOG_SHEET_ID"))[tab]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[logg] kunne ikke aapne regneark: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    row = [str(v)[:CELL_MAX] if v is not None else "" for v in values]
+
+    def work():
+        try:
+            ws.append_row(row, value_input_option="RAW")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[logg] skriving feilet: {type(exc).__name__}: {exc}", file=sys.stderr)
+    threading.Thread(target=work, daemon=True).start()
+
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def tester_id():
+    """Valgfri tester-ID fra lenken, f.eks. ...streamlit.app/?tester=T01"""
+    return re.sub(r"[^\w-]", "", str(st.query_params.get("tester", "")))[:20]
+
+
+def on_feedback(answer_id):
+    score = st.session_state.get(f"fb_{answer_id}")
+    if score is not None:
+        log_event("vurdering", [now_str(), answer_id, tester_id(), st.session_state.session_id,
+                                "👍" if score == 1 else "👎", ""])
+
+
+def on_comment(answer_id):
+    text = (st.session_state.get(f"fbc_{answer_id}") or "").strip()
+    score = st.session_state.get(f"fb_{answer_id}")
+    if text:
+        log_event("vurdering", [now_str(), answer_id, tester_id(), st.session_state.session_id,
+                                "👍" if score == 1 else "👎" if score == 0 else "", text[:2000]])
+
+
 EXAMPLE_QUESTIONS = [
     "Hvilke aktiviteter finnes for barn og unge i Åsane?",
     "Hjelp til eldre som bor hjemme",
@@ -673,7 +755,7 @@ def render_documents(docs, total, key):
                 st.rerun()
 
 
-def render_assistant(message, idx):
+def render_assistant(message, idx, show_feedback=True):
     st.markdown(message.get("content") or "Ingen svar.")
     docs = message.get("sources") or []
     if docs:
@@ -681,6 +763,14 @@ def render_assistant(message, idx):
         total = message.get("total", len(docs))
         with st.expander(f"📄 Kilder ({total} dokumenter)"):
             render_documents(docs, total, str(idx))
+    answer_id = message.get("id")
+    if show_feedback and answer_id and logging_enabled():
+        st.caption("Var svaret nyttig?")
+        st.feedback("thumbs", key=f"fb_{answer_id}", on_change=on_feedback, args=(answer_id,))
+        if st.session_state.get(f"fb_{answer_id}") is not None:
+            st.text_input("Kommentar (valgfritt) – trykk Enter for å sende",
+                          key=f"fbc_{answer_id}", on_change=on_comment, args=(answer_id,),
+                          placeholder="Hva var bra eller dårlig?")
 
 
 if not DB_PATH.is_file():
@@ -694,6 +784,8 @@ except (sqlite3.Error, RuntimeError):
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = uuid.uuid4().hex[:8]
 
 head_left, head_right = st.columns([5, 1], vertical_alignment="center")
 with head_left:
@@ -711,6 +803,9 @@ if not st.session_state.messages:
         with ex_col:
             if st.button(example, use_container_width=True, key=f"ex_{example}"):
                 example_clicked = example
+    if logging_enabled():
+        st.caption("Spørsmål, svar og vurderinger lagres for å forbedre tjenesten. "
+                   "Ikke skriv inn personopplysninger.")
 
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
@@ -733,7 +828,10 @@ if question and question.strip():
         except sqlite3.Error:
             st.error("Søket feilet. Prøv igjen.")
             st.stop()
+        t0 = time.perf_counter()
+        status = "ok"
         if not docs:
+            status = "ingen_treff"
             answer = ("Jeg fant ingen dokumenter som passer til spørsmålet. "
                       "Det betyr ikke at tilbudet ikke finnes. Prøv gjerne andre ord.")
         else:
@@ -742,6 +840,7 @@ if question and question.strip():
                     answer, _usage = generate(question, docs[:AI_SOURCES], history)
                     answer = normalize_markdown(answer)
                 except Exception as exc:
+                    status = f"feil: {type(exc).__name__} {error_status(exc) or ''}".strip()
                     if is_transient(exc):
                         answer = ("Tjenesten er midlertidig opptatt. Vent et minutt og prøv igjen. "
                                   "Dokumentene som ble funnet, ligger under Kilder.")
@@ -749,8 +848,18 @@ if question and question.strip():
                         answer = ("Det oppstod en feil da svaret skulle lages. "
                                   "Dokumentene som ble funnet, ligger under Kilder.")
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
-        message = {"role": "assistant", "content": answer, "sources": docs, "total": total}
-        render_assistant(message, len(st.session_state.messages))
+        answer_id = uuid.uuid4().hex[:10]
+        message = {"role": "assistant", "content": answer, "sources": docs, "total": total,
+                   "id": answer_id}
+        top = docs[:AI_SOURCES]
+        log_event("svar", [
+            now_str(), answer_id, tester_id(), st.session_state.session_id, question, answer,
+            total, " | ".join(f"[{i}] {d.get('tittel') or ''} <{d.get('url') or ''}>"
+                              for i, d in enumerate(top, 1)),
+            GROQ_MODEL, f"{time.perf_counter() - t0:.1f}", status,
+        ])
+        # Vurdering vises foerst etter omlastingen under (unngaar dobbel widget).
+        render_assistant(message, len(st.session_state.messages), show_feedback=False)
     st.session_state.messages.append(message)
     # Ny kjoering slik at eksempelknappene forsvinner og «Ny samtale» vises.
     st.rerun()
