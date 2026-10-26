@@ -1,5 +1,7 @@
 """Kommunal dokumentassistent – ChatGPT-lignende Streamlit-grensesnitt.
-Felles SQLite FTS5, valgfri Groq/Gemini eller sammenligning av begge.
+Hybrid sok: SQLite FTS5 (nokkelord) + semantisk sok (nomic-embed-text-vektorer
+fra bergen_vec.db), slatt sammen med Reciprocal Rank Fusion.
+Valgfri Groq/Gemini eller sammenligning av begge.
 Secrets: GROQ_API_KEY og/eller GEMINI_API_KEY.
 """
 from __future__ import annotations
@@ -17,6 +19,16 @@ import streamlit as st
 st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="centered")
 # Databasen ligger i samme mappe som app.py (lokalt og i Streamlit Cloud).
 DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
+# Vektorfil fra 09_bergen_vektorer.R. Mangler den, brukes bare nokkelordsok.
+VEC_PATH = Path(__file__).resolve().parent / "bergen_vec.db"
+# Samme modell som Ollama "nomic-embed-text" (v1.5), kjort via fastembed/ONNX.
+QUERY_EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+# Dokumentblokkene ble embeddet UTEN prefiks i Ollama. Diagnosen i appen
+# viser om "search_query: " gir bedre samsvar; endre her ved behov.
+QUERY_PREFIX = ""
+SEM_TOP_CHUNKS = 400   # antall naermeste blokker for de grupperes per dokument
+RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
+SEARCH_MODES = ["Hybrid", "Nøkkelord", "Semantisk"]
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 # Gemini-modeller i prioritert rekkefolge. Ved 429/503/504 provs neste modell.
 # Testperiode: bare Flash-Lite (billig, gratisnivaa). Flash kan legges til forst
@@ -209,6 +221,117 @@ def search_documents(question):
             ).fetchall()
             return [dict(row) for row in rows], total, mode
     return [], 0, "INGEN"
+
+
+# ---------------------------------------------------------------------------
+# Semantisk sok
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Laster vektorindeks ...")
+def load_vectors(path, mtime):
+    """Les int8-vektorer fra bergen_vec.db og returner normalisert float32-matrise."""
+    import numpy as np
+    uri = f"file:{quote(str(path), safe='/:')}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as con:
+        meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
+        rows = con.execute("SELECT doc_id, scale, v FROM vec ORDER BY chunk_id").fetchall()
+    dims = int(meta.get("dims", 768))
+    doc_ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
+    scale = np.fromiter((r[1] for r in rows), dtype=np.float32, count=len(rows))
+    q = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.int8).reshape(len(rows), dims)
+    mat = q.astype(np.float32) * scale[:, None]
+    mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+    return doc_ids, mat, meta
+
+
+@st.cache_resource(show_spinner="Laster embedding-modell (første gang tar dette litt tid) ...")
+def embed_model(name):
+    from fastembed import TextEmbedding
+    return TextEmbedding(model_name=name)
+
+
+def embed_texts(texts):
+    import numpy as np
+    vecs = np.asarray(list(embed_model(QUERY_EMBED_MODEL).embed(list(texts))), dtype=np.float32)
+    return vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
+
+
+def vectors_available():
+    return VEC_PATH.is_file()
+
+
+def semantic_doc_ranking(question, limit=MAX_LIST_RESULTS):
+    """Rangerer dokumenter etter beste blokk (maks cosinus). [(doc_id, score)]."""
+    import numpy as np
+    doc_ids, mat, _ = load_vectors(str(VEC_PATH), VEC_PATH.stat().st_mtime_ns)
+    sims = mat @ embed_texts([QUERY_PREFIX + question])[0]
+    k = min(SEM_TOP_CHUNKS, len(sims))
+    top = np.argpartition(-sims, k - 1)[:k]
+    top = top[np.argsort(-sims[top])]
+    best = {}
+    for i in top:
+        d = int(doc_ids[i])
+        if d not in best:
+            best[d] = float(sims[i])
+            if len(best) >= limit:
+                break
+    return list(best.items())
+
+
+def fetch_documents(doc_ids):
+    """Hent dokumentrader i samme rekkefolge som doc_ids."""
+    if not doc_ids:
+        return []
+    marks = ",".join("?" * len(doc_ids))
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            f"""SELECT doc_id,tittel,url,oppsummering,tekstutdrag,tema,malgruppe,
+                       informasjonstype,kommune,dokumentdato
+                FROM documents WHERE doc_id IN ({marks})""", list(doc_ids)).fetchall()
+    by_id = {r["doc_id"]: dict(r) for r in rows}
+    return [by_id[d] for d in doc_ids if d in by_id]
+
+
+def rrf_merge(*rankings, k=RRF_K):
+    """Reciprocal Rank Fusion: summen av 1/(k + rang) over alle lister."""
+    scores = {}
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, 1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=lambda d: (-scores[d], d))
+
+
+def run_search(question, method):
+    """Returner (dokumenter, antall, modus-tekst, merknad) for valgt sokemetode."""
+    if method == "Nøkkelord" or not vectors_available():
+        docs, total, mode = search_documents(question)
+        note = None if method == "Nøkkelord" else "Vektorfil mangler; bruker nøkkelordsøk."
+        return docs, total, f"Nøkkelord · {mode}", note
+    try:
+        sem = semantic_doc_ranking(question)
+    except Exception as exc:  # modell/vektorfeil: fall tilbake, men si fra
+        docs, total, mode = search_documents(question)
+        return docs, total, f"Nøkkelord · {mode}", f"Semantisk søk feilet ({type(exc).__name__}); bruker nøkkelordsøk."
+    sem_ids = [d for d, _ in sem]
+    sem_score = dict(sem)
+    if method == "Semantisk":
+        docs = fetch_documents(sem_ids)
+        for d in docs:
+            d["sem_score"] = sem_score.get(d["doc_id"])
+        return docs, len(docs), "Semantisk", None
+    fts_docs, fts_total, fts_mode = search_documents(question)
+    fts_ids = [d["doc_id"] for d in fts_docs]
+    merged = rrf_merge(fts_ids, sem_ids)[:MAX_LIST_RESULTS]
+    known = {d["doc_id"]: d for d in fts_docs}
+    missing = [d for d in merged if d not in known]
+    known.update({d["doc_id"]: d for d in fetch_documents(missing)})
+    docs = [known[d] for d in merged if d in known]
+    fts_set = set(fts_ids)
+    for d in docs:
+        d["sem_score"] = sem_score.get(d["doc_id"])
+        d["kilde_sok"] = ("begge" if d["doc_id"] in fts_set and d["doc_id"] in sem_score
+                          else "nøkkelord" if d["doc_id"] in fts_set else "semantisk")
+    return docs, len(docs), f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk", None
 
 
 def context(docs):
@@ -473,7 +596,13 @@ def render_documents(docs, total, key):
             st.markdown(f"**{i}. {title}**")
             st.caption(f"{doc.get('kommune') or 'Ukjent kommune'} · {doc.get('dokumentdato') or 'Udatert'} · {doc.get('informasjonstype') or 'Ukjent type'}")
             st.write(doc.get("oppsummering") or doc.get("tekstutdrag") or "Ingen beskrivelse")
-            st.caption(f"Tema: {doc.get('tema') or '–'} · Målgruppe: {doc.get('malgruppe') or '–'}")
+            extra = []
+            if doc.get("kilde_sok"):
+                extra.append(f"Funnet av: {doc['kilde_sok']}")
+            if doc.get("sem_score") is not None:
+                extra.append(f"likhet {doc['sem_score']:.2f}")
+            st.caption(f"Tema: {doc.get('tema') or '–'} · Målgruppe: {doc.get('malgruppe') or '–'}"
+                       + ("" if not extra else " · " + " · ".join(extra)))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
@@ -521,10 +650,12 @@ def render_assistant(message, idx):
     docs = message.get("sources") or []
     if docs:
         total = message.get("total", len(docs))
-        mode = message.get("search_mode", "AND")
-        st.caption(f"SQLite FTS5: {total} treff ({mode}-søk). Begge modeller bruker de samme {min(AI_SOURCES, len(docs))} øverste dokumentene.")
-        if mode == "MINST_2":
+        mode = message.get("search_mode", "Nøkkelord · AND")
+        st.caption(f"Søk: {mode} · {total} dokumenter. Modellene bruker de samme {min(AI_SOURCES, len(docs))} øverste.")
+        if "MINST_2" in mode and not mode.startswith("Hybrid"):
             st.caption("Utvidet søk kan inneholde svakt relevante dokumenter. Kontroller originalkildene.")
+        if message.get("search_note"):
+            st.warning(message["search_note"])
         with st.expander(f"📄 Vis dokumenter ({total} treff)"):
             render_documents(docs, total, str(idx))
 
@@ -554,7 +685,29 @@ with right:
         st.session_state.messages = []
         st.rerun()
 
-st.caption(f"{count:,} dokumenter · SQLite FTS5 · Ingen lokal Ollama".replace(",", " "))
+search_method = st.radio(
+    "Søkemetode", SEARCH_MODES, index=0 if vectors_available() else 1,
+    horizontal=True, key="search_method",
+    help="Hybrid = nøkkelord + semantisk (meningslikhet). Brukes for å sammenligne metodene.",
+)
+vec_info = "semantisk indeks: nomic-embed-text" if vectors_available() else "ingen semantisk indeks (bergen_vec.db mangler)"
+st.caption(f"{count:,} dokumenter · SQLite FTS5 · {vec_info}".replace(",", " "))
+
+if vectors_available():
+    with st.expander("🔧 Diagnose: semantisk modell"):
+        st.caption("Sjekker at spørsmåls-embeddingen (fastembed) gir samme vektorer som Ollama "
+                   "brukte for dokumentene. Cosinus nær 1,00 betyr samme modell.")
+        if st.button("Kjør kontroll"):
+            import numpy as np
+            uri = f"file:{quote(str(VEC_PATH), safe='/:')}?mode=ro"
+            with sqlite3.connect(uri, uri=True) as con:
+                rows = con.execute("SELECT input, v32 FROM verify").fetchall()
+            ref = np.stack([np.frombuffer(r[1], dtype="<f4") for r in rows])
+            ref /= np.linalg.norm(ref, axis=1, keepdims=True)
+            with st.spinner("Beregner ..."):
+                for prefix in ("", "search_document: "):
+                    cos = (embed_texts([prefix + r[0] for r in rows]) * ref).sum(axis=1)
+                    st.write(f"Prefiks «{prefix or '(ingen)'}»: cosinus snitt {cos.mean():.4f}, min {cos.min():.4f}")
 if not st.session_state.messages:
     st.caption("Prøv for eksempel: «Hvilke aktiviteter finnes for barn og unge i Åsane?»")
 
@@ -575,8 +728,8 @@ if question and question.strip():
     with st.chat_message("assistant"):
         started = time.perf_counter()
         try:
-            with st.spinner("Søker i SQLite ..."):
-                docs, total, search_mode = search_documents(question)
+            with st.spinner(f"Søker ({search_method.lower()}) ..."):
+                docs, total, search_mode, search_note = run_search(question, search_method)
         except sqlite3.Error as exc:
             st.error(f"SQLite-søkefeil: {exc}")
             st.stop()
@@ -609,9 +762,9 @@ if question and question.strip():
                     "usage": usage,
                 }
         message = {"role": "assistant", "answers": answer_data, "sources": docs,
-                   "total": total, "search_mode": search_mode}
+                   "total": total, "search_mode": search_mode, "search_note": search_note}
         render_assistant(message, len(st.session_state.messages))
-        st.caption(f"Søketid SQLite: {search_seconds:.2f} sekunder")
+        st.caption(f"Søketid: {search_seconds:.2f} sekunder")
     st.session_state.messages.append(message)
 
 st.caption("AI-svar er basert på begrensede dokumentutdrag. Kontroller alltid originalkildene.")
