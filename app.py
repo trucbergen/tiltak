@@ -7,6 +7,7 @@ Secrets: GROQ_API_KEY og/eller GEMINI_API_KEY.
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import sqlite3
@@ -28,6 +29,12 @@ QUERY_EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
 # Dokumentblokkene ble embeddet UTEN prefiks i Ollama. Diagnosen i appen
 # viser om "search_query: " gir bedre samsvar; endre her ved behov.
 QUERY_PREFIX = ""
+# Embedding-modellen kjoeres i en egen prosess (embed_worker.py). Krasjer den
+# (minne/segfault), lever appen videre og bruker noekkelordsok.
+EMBED_WORKER = Path(__file__).resolve().parent / "embed_worker.py"
+EMBED_LOAD_TIMEOUT = 180   # sekunder: forste gang lastes modellen ned
+EMBED_QUERY_TIMEOUT = 30
+EMBED_MAX_RESTARTS = 2
 SEM_TOP_CHUNKS = 400   # antall naermeste blokker for de grupperes per dokument
 RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
 SEARCH_MODES = ["Hybrid", "Nøkkelord", "Semantisk"]
@@ -247,16 +254,90 @@ def load_vectors(path, mtime):
     return doc_ids, mat.astype(np.float16), meta
 
 
-@st.cache_resource(show_spinner="Laster embedding-modell (første gang tar dette litt tid) ...")
-def embed_model(name):
-    from fastembed import TextEmbedding
-    # Én traad holder minnebruken nede i Streamlit Cloud (~1 GB).
-    return TextEmbedding(model_name=name, threads=1)
+class EmbedWorker:
+    """Holder en embed_worker.py-prosess i live og snakker JSON-linjer med den."""
+
+    def __init__(self):
+        import tempfile
+        import threading
+        self.lock = threading.Lock()
+        self.proc = None
+        self.restarts = 0
+        self.last_error = None
+        self.stderr_path = Path(tempfile.gettempdir()) / "embed_worker_stderr.log"
+
+    def _readline(self, timeout):
+        import queue
+        import threading
+        q = queue.Queue()
+        threading.Thread(target=lambda: q.put(self.proc.stdout.readline()), daemon=True).start()
+        try:
+            line = q.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"Embedding-prosessen svarte ikke innen {timeout} s")
+        if not line:
+            raise RuntimeError("Embedding-prosessen stoppet " + self._exit_reason())
+        return json.loads(line)
+
+    def _exit_reason(self):
+        code = self.proc.poll() if self.proc else None
+        tail = ""
+        try:
+            tail = self.stderr_path.read_text(errors="replace").strip().splitlines()[-1][:200]
+        except (OSError, IndexError):
+            pass
+        why = {-9: "(drept – trolig tom for minne)", -11: "(segmenteringsfeil)",
+               137: "(drept – trolig tom for minne)", 139: "(segmenteringsfeil)"}.get(code, f"(kode {code})")
+        return why + (f": {tail}" if tail else "")
+
+    def _start(self):
+        import subprocess
+        import sys
+        if self.restarts > EMBED_MAX_RESTARTS:
+            raise RuntimeError("Embedding-prosessen er deaktivert etter gjentatte krasj "
+                               + (self.last_error or ""))
+        self.restarts += 1
+        self.proc = subprocess.Popen(
+            [sys.executable, str(EMBED_WORKER), QUERY_EMBED_MODEL, "1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=open(self.stderr_path, "w"), text=True, bufsize=1,
+        )
+        msg = self._readline(EMBED_LOAD_TIMEOUT)
+        if not msg.get("ready"):
+            raise RuntimeError(msg.get("error", "Ukjent feil ved lasting av modell"))
+
+    def embed(self, texts):
+        with self.lock:
+            try:
+                if self.proc is None or self.proc.poll() is not None:
+                    self._start()
+                self.proc.stdin.write(json.dumps({"texts": list(texts)}) + "\n")
+                self.proc.stdin.flush()
+                msg = self._readline(EMBED_QUERY_TIMEOUT)
+            except (BrokenPipeError, OSError) as exc:
+                self.last_error = f"{type(exc).__name__} {self._exit_reason()}"
+                self.proc = None
+                raise RuntimeError(self.last_error) from exc
+            except Exception as exc:
+                self.last_error = str(exc)
+                if self.proc is not None and self.proc.poll() is None:
+                    self.proc.kill()
+                self.proc = None
+                raise
+            if "error" in msg:
+                raise RuntimeError(msg["error"])
+            return msg["vecs"]
+
+
+@st.cache_resource(show_spinner=False)
+def embed_worker():
+    return EmbedWorker()
 
 
 def embed_texts(texts):
     import numpy as np
-    vecs = np.asarray(list(embed_model(QUERY_EMBED_MODEL).embed(list(texts))), dtype=np.float32)
+    with st.spinner("Lager spørsmålsvektor (første gang lastes modellen, kan ta et minutt) ..."):
+        vecs = np.asarray(embed_worker().embed(texts), dtype=np.float32)
     return vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
 
 
@@ -316,7 +397,8 @@ def run_search(question, method):
         sem = semantic_doc_ranking(question)
     except Exception as exc:  # modell/vektorfeil: fall tilbake, men si fra
         docs, total, mode = search_documents(question)
-        return docs, total, f"Nøkkelord · {mode}", f"Semantisk søk feilet ({type(exc).__name__}); bruker nøkkelordsøk."
+        return docs, total, f"Nøkkelord · {mode}", (
+            f"Semantisk søk feilet ({type(exc).__name__}: {str(exc)[:250]}); bruker nøkkelordsøk.")
     sem_ids = [d for d, _ in sem]
     sem_score = dict(sem)
     if method == "Semantisk":
