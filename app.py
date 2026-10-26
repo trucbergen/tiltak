@@ -53,6 +53,7 @@ SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 6
+SHOW_SOURCES = 20  # antall dokumenter som vises under «Kilder» (de mest relevante)
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
 PAGE_SIZE = 5
@@ -582,7 +583,11 @@ SYSTEM_PROMPT = (
     "Svar direkte på spørsmålet. "
     "Prioriter dokumenter som gjelder riktig geografisk område, "
     "målgruppe og tjeneste. "
-    "Skill mellom tilbud i Åsane og generelle tilbud i Bergen. "
+    "Skill mellom tilbud i en bestemt bydel (f.eks. Åsane, Fana, Arna) og tilbud for hele Bergen. "
+    "Ikke skriv at et tilbud gjelder, finnes eller er tilgjengelig i en bydel "
+    "med mindre kilden nevner bydelen eksplisitt. Spør brukeren om en bydel og "
+    "kildene bare gjelder hele Bergen, si det tydelig, f.eks. «Kildene beskriver "
+    "tilbud for hele Bergen, ikke spesifikt for Åsane». "
     "Ikke presenter private tilbud som kommunale tjenester. "
     "Beskriv dokumenterte tilbud som eksempler, "
     "ikke som en fullstendig oversikt. "
@@ -896,8 +901,8 @@ def render_assistant(message, idx, show_feedback=True):
     if docs:
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
-        with st.expander(f"📄 Kilder ({total} dokumenter)"):
-            render_documents(docs, total, str(idx))
+        with st.expander(f"📄 Kilder ({len(docs)} mest relevante dokumenter)"):
+            render_documents(docs, len(docs), str(idx))
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -988,7 +993,7 @@ if question and question.strip():
                                   "Dokumentene som ble funnet, ligger under Kilder.")
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
-        message = {"role": "assistant", "content": answer, "sources": docs, "total": total,
+        message = {"role": "assistant", "content": answer, "sources": docs[:SHOW_SOURCES], "total": total,
                    "id": answer_id}
         top = docs[:AI_SOURCES]
         log_event("svar", [
