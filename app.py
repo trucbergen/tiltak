@@ -792,23 +792,67 @@ def log_sheet(sheet_id):
     return tabs
 
 
-def log_event(tab, values):
-    """Skriver én rad i bakgrunnen. Feil i loggingen stopper aldri appen."""
-    if not logging_enabled():
-        return
+@st.cache_resource(show_spinner=False)
+def log_queue():
+    """Én bakgrunnstraad skriver alle logg-operasjoner i rekkefoelge.
+    Da kommer en oppdatering av en vurdering alltid etter at raden er laget."""
+    import queue
+    q = queue.Queue()
+
+    def worker():
+        while True:
+            op = q.get()
+            try:
+                op()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[logg] skriving feilet: {type(exc).__name__}: {exc}", file=sys.stderr)
+            finally:
+                q.task_done()
+    threading.Thread(target=worker, daemon=True).start()
+    return q
+
+
+def _worksheet(tab):
     try:
-        ws = log_sheet(secret("LOG_SHEET_ID"))[tab]
+        return log_sheet(secret("LOG_SHEET_ID"))[tab]
     except Exception as exc:  # noqa: BLE001
         print(f"[logg] kunne ikke aapne regneark: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
+def _clean_row(values):
+    return [str(v)[:CELL_MAX] if v is not None else "" for v in values]
+
+
+def log_event(tab, values):
+    """Legger til én rad i bakgrunnen. Feil i loggingen stopper aldri appen."""
+    if not logging_enabled():
         return
-    row = [str(v)[:CELL_MAX] if v is not None else "" for v in values]
+    ws = _worksheet(tab)
+    if ws is None:
+        return
+    row = _clean_row(values)
+    log_queue().put(lambda: ws.append_row(row, value_input_option="RAW"))
+
+
+def log_upsert(tab, key, values, key_col=2):
+    """Én rad per noekkel (svar-ID): oppdaterer raden hvis den finnes, ellers legges den til."""
+    if not logging_enabled():
+        return
+    ws = _worksheet(tab)
+    if ws is None:
+        return
+    row = _clean_row(values)
 
     def work():
-        try:
+        cell = ws.find(str(key), in_column=key_col)
+        if cell is None:
             ws.append_row(row, value_input_option="RAW")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[logg] skriving feilet: {type(exc).__name__}: {exc}", file=sys.stderr)
-    threading.Thread(target=work, daemon=True).start()
+        else:
+            last_col = chr(ord("A") + len(row) - 1)
+            ws.update(values=[row], range_name=f"A{cell.row}:{last_col}{cell.row}",
+                      value_input_option="RAW")
+    log_queue().put(work)
 
 
 def now_str():
@@ -820,20 +864,24 @@ def tester_id():
     return re.sub(r"[^\w-]", "", str(st.query_params.get("tester", "")))[:20]
 
 
-def on_feedback(answer_id):
+def _save_feedback(answer_id):
+    """Skriver/oppdaterer ÉN rad per svar med siste vurdering og kommentar."""
     score = st.session_state.get(f"fb_{answer_id}")
-    if score is not None:
-        log_event("vurdering", [now_str(), answer_id, tester_id(), st.session_state.session_id,
-                                "👍" if score == 1 else "👎", ""])
+    comment = st.session_state.get(f"fbc_saved_{answer_id}", "")
+    log_upsert("vurdering", answer_id, [now_str(), answer_id, tester_id(), st.session_state.session_id,
+                                        "👍" if score == 1 else "👎" if score == 0 else "", comment[:2000]])
+
+
+def on_feedback(answer_id):
+    if st.session_state.get(f"fb_{answer_id}") is not None:
+        _save_feedback(answer_id)
 
 
 def on_comment(answer_id):
     text = (st.session_state.get(f"fbc_{answer_id}") or "").strip()
-    score = st.session_state.get(f"fb_{answer_id}")
     if text:
         st.session_state[f"fbc_saved_{answer_id}"] = text
-        log_event("vurdering", [now_str(), answer_id, tester_id(), st.session_state.session_id,
-                                "👍" if score == 1 else "👎" if score == 0 else "", text[:2000]])
+        _save_feedback(answer_id)
 
 
 EXAMPLE_QUESTIONS = [
