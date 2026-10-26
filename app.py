@@ -694,6 +694,7 @@ def on_comment(answer_id):
     text = (st.session_state.get(f"fbc_{answer_id}") or "").strip()
     score = st.session_state.get(f"fb_{answer_id}")
     if text:
+        st.session_state[f"fbc_saved_{answer_id}"] = text
         log_event("vurdering", [now_str(), answer_id, tester_id(), st.session_state.session_id,
                                 "👍" if score == 1 else "👎" if score == 0 else "", text[:2000]])
 
@@ -771,6 +772,10 @@ def render_assistant(message, idx, show_feedback=True):
             st.text_input("Kommentar (valgfritt) – trykk Enter for å sende",
                           key=f"fbc_{answer_id}", on_change=on_comment, args=(answer_id,),
                           placeholder="Hva var bra eller dårlig?")
+            if st.session_state.get(f"fbc_saved_{answer_id}"):
+                st.caption("✓ Takk! Kommentaren er lagret.")
+            else:
+                st.caption("✓ Vurderingen er lagret. Skriv gjerne en kommentar.")
 
 
 if not DB_PATH.is_file():
