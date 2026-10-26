@@ -35,14 +35,14 @@ EMBED_WORKER = Path(__file__).resolve().parent / "embed_worker.py"
 EMBED_LOAD_TIMEOUT = 180   # sekunder: forste gang lastes modellen ned
 EMBED_QUERY_TIMEOUT = 30
 EMBED_MAX_RESTARTS = 2
-SEM_TOP_CHUNKS = 400
+SEM_TOP_CHUNKS = 400   # antall naermeste blokker for de grupperes per dokument
 # nomic-embed-text gir hoy likhet for nesten alt (irrelevante ~0,70, relevante
 # ~0,75), saa en fast grense virker daarlig. Vi bruker en RELATIV grense:
 # et dokument regnes som semantisk treff bare hvis likheten er innenfor
 # SEM_RELATIVE_MARGIN av beste treff for spoersmaalet, og maks SEM_MAX_DOCS.
 SEM_MIN_SIMILARITY = 0.50   # absolutt gulv (sikkerhetsnett)
-SEM_RELATIVE_MARGIN = 0.05  # hoyere = flere treff, lavere = faerre
-SEM_MAX_DOCS = 40   # antall naermeste blokker for de grupperes per dokument
+SEM_RELATIVE_MARGIN = 0.03  # hoyere = flere treff, lavere = faerre
+SEM_MAX_DOCS = 15           # maks antall semantiske dokumenttreff
 RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
 SEARCH_MODES = ["Hybrid", "Nøkkelord", "Semantisk"]
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
