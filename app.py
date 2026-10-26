@@ -36,10 +36,13 @@ EMBED_LOAD_TIMEOUT = 180   # sekunder: forste gang lastes modellen ned
 EMBED_QUERY_TIMEOUT = 30
 EMBED_MAX_RESTARTS = 2
 SEM_TOP_CHUNKS = 400
-# Semantiske treff under denne likheten (cosinus) regnes ikke som treff.
-# Relevante dokumenter ligger typisk paa 0,55-0,80 med nomic-embed-text.
-# Juster ved behov: hoyere = faerre, mer presise treff.
-SEM_MIN_SIMILARITY = 0.50   # antall naermeste blokker for de grupperes per dokument
+# nomic-embed-text gir hoy likhet for nesten alt (irrelevante ~0,70, relevante
+# ~0,75), saa en fast grense virker daarlig. Vi bruker en RELATIV grense:
+# et dokument regnes som semantisk treff bare hvis likheten er innenfor
+# SEM_RELATIVE_MARGIN av beste treff for spoersmaalet, og maks SEM_MAX_DOCS.
+SEM_MIN_SIMILARITY = 0.50   # absolutt gulv (sikkerhetsnett)
+SEM_RELATIVE_MARGIN = 0.05  # hoyere = flere treff, lavere = faerre
+SEM_MAX_DOCS = 40   # antall naermeste blokker for de grupperes per dokument
 RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
 SEARCH_MODES = ["Hybrid", "Nøkkelord", "Semantisk"]
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
@@ -357,9 +360,11 @@ def semantic_doc_ranking(question, limit=MAX_LIST_RESULTS):
     k = min(SEM_TOP_CHUNKS, len(sims))
     top = np.argpartition(-sims, k - 1)[:k]
     top = top[np.argsort(-sims[top])]
+    cutoff = max(SEM_MIN_SIMILARITY, float(sims[top[0]]) - SEM_RELATIVE_MARGIN) if len(top) else 1.0
+    limit = min(limit, SEM_MAX_DOCS)
     best = {}
     for i in top:
-        if sims[i] < SEM_MIN_SIMILARITY:
+        if sims[i] < cutoff:
             break  # sortert synkende: resten er under grensen
         d = int(doc_ids[i])
         if d not in best:
@@ -417,7 +422,8 @@ def run_search(question, method):
         docs = fetch_documents(sem_ids)
         for d in docs:
             d["sem_score"] = sem_score.get(d["doc_id"])
-        return docs, len(docs), f"Semantisk (likhet ≥ {SEM_MIN_SIMILARITY:.2f})", None
+        floor = min((d["sem_score"] for d in docs if d.get("sem_score") is not None), default=0)
+        return docs, len(docs), f"Semantisk (likhet ≥ {floor:.2f})", None
     fts_docs, fts_total, fts_mode = search_documents(question)
     fts_ids = [d["doc_id"] for d in fts_docs]
     merged = rrf_merge(fts_ids, sem_ids)[:MAX_LIST_RESULTS]
@@ -430,8 +436,9 @@ def run_search(question, method):
         d["sem_score"] = sem_score.get(d["doc_id"])
         d["kilde_sok"] = ("begge" if d["doc_id"] in fts_set and d["doc_id"] in sem_score
                           else "nøkkelord" if d["doc_id"] in fts_set else "semantisk")
+    floor = min(sem_score.values(), default=0)
     return docs, len(docs), (f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk "
-                             f"({len(sem_ids)} med likhet ≥ {SEM_MIN_SIMILARITY:.2f})"), None
+                             f"({len(sem_ids)} med likhet ≥ {floor:.2f})"), None
 
 
 def context(docs):
