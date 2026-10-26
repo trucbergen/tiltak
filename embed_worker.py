@@ -27,7 +27,8 @@ def main():
     for line in sys.stdin:
         try:
             texts = json.loads(line)["texts"]
-            vecs = [v.tolist() for v in model.embed(texts)]
+            # batch_size=1 holder minnetoppen lav ved lange tekster.
+            vecs = [v.tolist() for v in model.embed(texts, batch_size=1)]
             print(json.dumps({"vecs": vecs}), flush=True)
         except Exception as exc:  # noqa: BLE001
             print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), flush=True)
