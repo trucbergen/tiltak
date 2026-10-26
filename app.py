@@ -22,7 +22,9 @@ DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
 # Vektorfil fra 09_bergen_vektorer.R. Mangler den, brukes bare nokkelordsok.
 VEC_PATH = Path(__file__).resolve().parent / "bergen_vec.db"
 # Samme modell som Ollama "nomic-embed-text" (v1.5), kjort via fastembed/ONNX.
-QUERY_EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+# "-Q" er kvantisert (0,13 GB). Full modell (0,52 GB) gaar tom for minne i
+# Streamlit Cloud. Diagnosen viser hvor godt -Q samsvarer med Ollama-vektorene.
+QUERY_EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
 # Dokumentblokkene ble embeddet UTEN prefiks i Ollama. Diagnosen i appen
 # viser om "search_query: " gir bedre samsvar; endre her ved behov.
 QUERY_PREFIX = ""
@@ -238,15 +240,18 @@ def load_vectors(path, mtime):
     doc_ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
     scale = np.fromiter((r[1] for r in rows), dtype=np.float32, count=len(rows))
     q = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.int8).reshape(len(rows), dims)
+    del rows
     mat = q.astype(np.float32) * scale[:, None]
     mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
-    return doc_ids, mat, meta
+    # float16 halverer minnebruken; presisjonen er mer enn nok for rangering.
+    return doc_ids, mat.astype(np.float16), meta
 
 
 @st.cache_resource(show_spinner="Laster embedding-modell (første gang tar dette litt tid) ...")
 def embed_model(name):
     from fastembed import TextEmbedding
-    return TextEmbedding(model_name=name)
+    # Én traad holder minnebruken nede i Streamlit Cloud (~1 GB).
+    return TextEmbedding(model_name=name, threads=1)
 
 
 def embed_texts(texts):
@@ -263,7 +268,7 @@ def semantic_doc_ranking(question, limit=MAX_LIST_RESULTS):
     """Rangerer dokumenter etter beste blokk (maks cosinus). [(doc_id, score)]."""
     import numpy as np
     doc_ids, mat, _ = load_vectors(str(VEC_PATH), VEC_PATH.stat().st_mtime_ns)
-    sims = mat @ embed_texts([QUERY_PREFIX + question])[0]
+    sims = (mat @ embed_texts([QUERY_PREFIX + question])[0].astype(np.float16)).astype(np.float32)
     k = min(SEM_TOP_CHUNKS, len(sims))
     top = np.argpartition(-sims, k - 1)[:k]
     top = top[np.argsort(-sims[top])]
