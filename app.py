@@ -885,9 +885,9 @@ def on_comment(answer_id):
 
 
 EXAMPLE_QUESTIONS = [
-    "Hvilke aktiviteter finnes for barn og unge i Åsane?",
+    "Hvilke aktiviteter finnes for barn og unge?",
     "Hjelp til eldre som bor hjemme",
-    "Hva er status for bybanen til Åsane?",
+    "Hva er status for bybanen?",
 ]
 SUMMARY_MAX_CHARS = 350
 
