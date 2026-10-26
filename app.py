@@ -60,7 +60,7 @@ STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fin
 
 st.markdown("""<style>
 .block-container {max-width: 860px; padding-top: 2.2rem; padding-bottom: 5rem;}
-.hero {padding: 1.1rem 0 1.3rem;}
+.hero {padding: .6rem 0 .4rem;}
 .hero h1 {font-size: 2rem; letter-spacing: -.035em; margin: 0;}
 .hero p {color: #7a8595; margin-top: .55rem;}
 div[data-testid="stChatMessage"] {border-radius: 15px;}
@@ -506,7 +506,8 @@ TRUNCATED_TEXT = (
 FORMAT_REMINDER = (
     "\n\nFORMATKRAV: Svar med korte overskrifter og punktlister. "
     "Ingen tabeller. Ikke fyll inn felter som kildene ikke dokumenterer. "
-    "Ikke oppgi kontaktdetaljer; vis til kildene."
+    "Ikke oppgi telefonnummer, e-postadresser, adresser eller åpningstider, "
+    "selv om de står i kildene; vis til kilden i stedet."
 )
 
 
@@ -615,6 +616,30 @@ def generate(question, docs, history):
     return generate_groq(user_prompt, recent)
 
 
+EXAMPLE_QUESTIONS = [
+    "Hvilke aktiviteter finnes for barn og unge i Åsane?",
+    "Hjelp til eldre som bor hjemme",
+    "Hva er status for bybanen til Åsane?",
+]
+SUMMARY_MAX_CHARS = 350
+
+
+def clean_summary(text):
+    """Gjør oppsummeringen lesbar: fjern LLM-innledning, markdown og kontaktinfo, og kort ned."""
+    t = str(text or "").strip()
+    t = re.sub(r"(?is)^her er (en|et) (kort )?(oppsummering|sammendrag)[^:]*:\s*", "", t)
+    t = re.sub(r"#+\s*", "", t)                      # markdown-overskrifter
+    t = re.sub(r"\*\*|__|`", "", t)                  # fet skrift / kode
+    t = re.sub(r"(?i)-?\s*(send )?e-post(adresse)?:? (til )?\S+@\S+\.\w+[^.]*\.?", "", t)
+    t = re.sub(r"\S+@\S+\.\w+", "", t)               # e-postadresser
+    t = re.sub(r"[{}\[\]]", "", t)                    # rester av JSON
+    t = re.sub(r"\s+([.,;:])", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -:;")
+    if len(t) > SUMMARY_MAX_CHARS:
+        t = t[:SUMMARY_MAX_CHARS].rsplit(" ", 1)[0] + " …"
+    return t or "Ingen beskrivelse"
+
+
 def render_documents(docs, total, key):
     if not docs:
         return
@@ -629,7 +654,7 @@ def render_documents(docs, total, key):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
             st.markdown(f"**{i}. {title}**")
             st.caption(f"{doc.get('kommune') or 'Ukjent kommune'} · {doc.get('dokumentdato') or 'Udatert'} · {doc.get('informasjonstype') or 'Ukjent type'}")
-            st.write(doc.get("oppsummering") or doc.get("tekstutdrag") or "Ingen beskrivelse")
+            st.text(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
@@ -658,7 +683,6 @@ def render_assistant(message, idx):
             render_documents(docs, total, str(idx))
 
 
-st.markdown('<div class="hero"><h1>🔎 Kommunal dokumentassistent</h1><p>Spør om tjenester, tiltak og dokumenter fra kommuner og offentlige kilder.</p></div>', unsafe_allow_html=True)
 if not DB_PATH.is_file():
     st.error("Dokumentdatabasen er ikke tilgjengelig. Kontakt den som drifter tjenesten.")
     st.stop()
@@ -671,14 +695,22 @@ except (sqlite3.Error, RuntimeError):
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-_, right = st.columns([4, 1])
-with right:
-    if st.button("Ny samtale", use_container_width=True):
+head_left, head_right = st.columns([5, 1], vertical_alignment="center")
+with head_left:
+    st.markdown('<div class="hero"><h1>🔎 Kommunal dokumentassistent</h1><p>Spør om tjenester, '
+                'tiltak og dokumenter fra kommuner og offentlige kilder.</p></div>', unsafe_allow_html=True)
+with head_right:
+    if st.session_state.messages and st.button("Ny samtale", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
+example_clicked = None
 if not st.session_state.messages:
-    st.caption("Prøv for eksempel: «Hvilke aktiviteter finnes for barn og unge i Åsane?»")
+    st.caption("Prøv for eksempel:")
+    for ex_col, example in zip(st.columns(len(EXAMPLE_QUESTIONS)), EXAMPLE_QUESTIONS):
+        with ex_col:
+            if st.button(example, use_container_width=True, key=f"ex_{example}"):
+                example_clicked = example
 
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
@@ -687,7 +719,7 @@ for i, message in enumerate(st.session_state.messages):
         else:
             render_assistant(message, i)
 
-question = st.chat_input("Still et spørsmål om kommunale dokumenter ...")
+question = st.chat_input("Still et spørsmål om kommunale dokumenter ...") or example_clicked
 if question and question.strip():
     question = question.strip()[:1200]
     history = list(st.session_state.messages)
@@ -720,3 +752,5 @@ if question and question.strip():
         message = {"role": "assistant", "content": answer, "sources": docs, "total": total}
         render_assistant(message, len(st.session_state.messages))
     st.session_state.messages.append(message)
+    # Ny kjoering slik at eksempelknappene forsvinner og «Ny samtale» vises.
+    st.rerun()
