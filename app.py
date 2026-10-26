@@ -142,17 +142,144 @@ def words_from_question(question):
     return list(dict.fromkeys(w for w in words if len(w) >= 2 and w not in STOPWORDS))[:12]
 
 
+# Sidetype leses fra URL-en (samme inndeling som bergen.kommune.no).
+SIDETYPER = [
+    ("/innbyggerhjelpen/", "Tjenester"),
+    ("/hvaskjer/", "Nyheter og aktuelt"),
+    ("/omkommunen/", "Om kommunen"),
+    ("/politikk/", "Politikk"),
+]
+SERVICE_BONUS = 4  # ekstra vekt for tjenestesider i rangeringen
+
+
+def page_type(url):
+    url = str(url or "")
+    for part, label in SIDETYPER:
+        if part in url:
+            return label
+    return "Annet"
+
+
+def page_path(url, depth=2):
+    """Lesbar sti fra URL, f.eks. «Helse og omsorg › Omsorgstjenester»."""
+    import urllib.parse
+    path = urllib.parse.urlparse(str(url or "")).path.strip("/").split("/")
+    parts = [urllib.parse.unquote(x).replace("-", " ").strip() for x in path[1:1 + depth] if x]
+    return " › ".join(x[:1].upper() + x[1:] for x in parts if x)
+
+
+# Stedsnavn er valgfrie: de gir ekstra vekt, men er ikke et krav i soeket.
+PLACE_NAMES = {"åsane", "arna", "fana", "ytrebygda", "laksevåg", "fyllingsdalen", "årstad",
+               "bergenhus", "sentrum"}
+PLACE_BONUS = 8
+PREFIX_MIN = 5  # ord med minst 5 bokstaver soekes som prefiks (bybane -> bybane*)
+
+
+def _like_any_case(field, word):
+    """SQLite lower() gjoer bare ASCII smaa, saa vi matcher baade 'åsane' og 'Åsane'."""
+    cap = word[:1].upper() + word[1:]
+    return (f"(lower(coalesce({field},'')) LIKE ? OR coalesce({field},'') LIKE ?)",
+            ["%" + word + "%", "%" + cap + "%"])
+
+
 def search_documents(question):
     """FTS5: presist sok forst, deretter minst to sentrale soketermer.
 
-    Et enkelt ord er aldri nok ved fallback for lange sporsmal.
+    - Ord med minst PREFIX_MIN bokstaver soekes som prefiks (boeyning/sammensetning).
+    - Bydeler er valgfrie og gir ekstra vekt (PLACE_BONUS).
+    - Felt-vekt telles ikke dobbelt for sammensatte ord (eldre + omsorg i «eldreomsorg»).
     Returnerer (dokumenter, antall_treff, sokemodus).
     """
     from itertools import combinations
 
-    words = words_from_question(question)
-    if not words:
+    all_words = words_from_question(question)
+    if not all_words:
         return [], 0, "INGEN"
+
+    # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
+    generic = {
+        "bergen", "bergens", "dokument", "dokumenter", "dokumentasjon",
+        "informasjon", "opplysninger", "kommunale", "kommunal", "eksempel",
+        "eksempler", "sammenlign", "forklar", "sporsmal", "spørsmål",
+        "oppgi", "kilder", "kilde", "aktuelle", "mulige", "spesifikke",
+    }
+    places = [w for w in all_words if w in PLACE_NAMES]
+    words = [w for w in all_words if w not in PLACE_NAMES and w not in {"bergen", "bergens"}]
+    if not words:  # bare stedsnavn (eller «Bergen»): soek paa dem
+        words, places = all_words, []
+    important = [w for w in words if w not in generic and not w.isdigit()]
+    if not important:
+        important = [w for w in words if w not in generic] or words
+
+    # Lengre fagord har ofte stor verdi, men behold ogsa noen korte ord.
+    core = sorted(important, key=lambda w: (-len(w), words.index(w)))[:6]
+
+    def quote_word(w):
+        star = "*" if len(w) >= PREFIX_MIN else ""
+        return '"' + w.replace('"', '') + '"' + star
+
+    # Soketrinn: alle ord, de viktigste tre, sa minst to av de fem viktigste.
+    queries = [("AND", " AND ".join(map(quote_word, words)))]
+    if len(core) >= 3:
+        queries.append(("KJERNE", " AND ".join(map(quote_word, core[:3]))))
+    if len(core) >= 2:
+        pairs = list(combinations(core[:5], 2))
+        pair_query = " OR ".join(
+            "(" + quote_word(x) + " AND " + quote_word(y) + ")"
+            for x, y in pairs
+        )
+        queries.append(("MINST_2", pair_query))
+    elif len(core) == 1:
+        queries.append(("ETT_FAGORD", quote_word(core[0])))
+
+    # FTS5 bm25: lavere verdi er bedre. Tittel, tema og malgruppe
+    # prioriteres, men selve dokumentteksten teller fortsatt.
+    bm25 = "bm25(documents_fts_full, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
+    bonus_parts, bonus_params = [], []
+    # Full vekt for forste soekeord som treffer feltet, litt mer per ekstra ord.
+    for field, first, extra in (("d.tittel", 6, 2), ("d.tema", 4, 1), ("d.malgruppe", 3, 1)):
+        cases, params = [], []
+        for word in core[:5]:
+            cond, prm = _like_any_case(field, word)
+            cases.append(f"(CASE WHEN {cond} THEN 1 ELSE 0 END)")
+            params += prm
+        if cases:
+            n = "(" + " + ".join(cases) + ")"
+            bonus_parts.append(f"({first} * min({n}, 1) + {extra} * max({n} - 1, 0))")
+            bonus_params += params + params
+    for place in places:
+        conds, prm = [], []
+        for field in ("d.tittel", "d.oppsummering", "d.malgruppe", "d.tekstutdrag"):
+            c, p = _like_any_case(field, place)
+            conds.append(c)
+            prm += p
+        bonus_parts.append(f"(CASE WHEN {' OR '.join(conds)} THEN {PLACE_BONUS} ELSE 0 END)")
+        bonus_params += prm
+    bonus_parts.append(f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)")
+    bonus_sql = " + ".join(bonus_parts) or "0"
+
+    sql = f"""SELECT d.doc_id,d.tittel,d.url,d.oppsummering,d.tekstutdrag,
+                      d.tema,d.malgruppe,d.informasjonstype,d.kommune,d.dokumentdato,
+                      {bm25} AS score
+               FROM documents_fts_full
+               JOIN documents d ON d.rowid=documents_fts_full.rowid
+               WHERE documents_fts_full MATCH ?
+               ORDER BY ({bm25} - ({bonus_sql})),d.doc_id LIMIT ?"""
+
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        for mode, expr in queries:
+            total = con.execute(
+                "SELECT COUNT(*) FROM documents_fts_full WHERE documents_fts_full MATCH ?",
+                (expr,),
+            ).fetchone()[0]
+            if total == 0:
+                continue
+            rows = con.execute(
+                sql, (expr, *bonus_params, MAX_LIST_RESULTS)
+            ).fetchall()
+            return [dict(row) for row in rows], total, mode
+    return [], 0, "INGEN"
 
     # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
     generic = {
@@ -193,6 +320,7 @@ def search_documents(question):
                 f"(CASE WHEN lower(coalesce(d.{field},'')) LIKE ? THEN {weight} ELSE 0 END)"
             )
             bonus_params.append("%" + word + "%")
+    bonus_parts.append(f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)")
     bonus_sql = " + ".join(bonus_parts) or "0"
 
     sql = f"""SELECT d.doc_id,d.tittel,d.url,d.oppsummering,d.tekstutdrag,
@@ -430,6 +558,7 @@ def context(docs):
             f"KILDE [{i}]\nTittel: {doc.get('tittel') or ''}\n"
             f"URL: {doc.get('url') or ''}\nKommune: {doc.get('kommune') or ''}\n"
             f"Tema: {doc.get('tema') or ''}\nType: {doc.get('informasjonstype') or ''}\n"
+            f"Sidetype: {page_type(doc.get('url'))}\n"
             f"{('Oppsummering: ' + summary + chr(10) + 'Utdrag: ' + excerpt)[:MAX_CONTEXT_CHARS]}"
         )
     return "\n\n".join(blocks)
@@ -461,6 +590,9 @@ SYSTEM_PROMPT = (
     "(for eksempel utlysninger til utøvere, budsjettall eller nyhetsartikler), "
     "med mindre spørsmålet gjelder nettopp dette. "
     "Beskriv forslag og planer som forslag, ikke som eksisterende tilbud. "
+    "Kilder med «Sidetype: Tjenester» er kommunens faste tjenestesider; "
+    "bruk dem først når spørsmålet gjelder hva kommunen tilbyr. "
+    "Nyheter kan være utdaterte; oppgi dato når du bruker dem. "
 
     "USIKKERHET: "
     "Dersom dokumentene ikke inneholder nok informasjon, "
@@ -736,7 +868,9 @@ def render_documents(docs, total, key):
         with st.container(border=True):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
             st.markdown(f"**{i}. {title}**")
-            st.caption(f"{doc.get('kommune') or 'Ukjent kommune'} · {doc.get('dokumentdato') or 'Udatert'} · {doc.get('informasjonstype') or 'Ukjent type'}")
+            sti = page_path(doc.get("url"))
+            st.caption(" · ".join(x for x in [page_type(doc.get("url")), sti,
+                                              doc.get("dokumentdato") or "Udatert"] if x))
             st.text(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
