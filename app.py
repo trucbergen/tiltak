@@ -593,7 +593,7 @@ _EMAIL = re.compile(r"\S+@\S+\.\w+")
 _PHONE = re.compile(r"(?<!\d)(?:\+47[\s-]?)?(?:\d{2}[\s-]?){3}\d{2}(?!\d)|(?<!\d)\d{3}[\s-]\d{2}[\s-]\d{3}(?!\d)")
 _TIME = re.compile(r"(?i)\b(?:kl(?:okken|\.)?\s*)?\d{1,2}[.:]\d{2}(?:\s*[-–]\s*\d{1,2}[.:]\d{2})?\b")
 _DAYS = r"(?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag|hverdag|helg|helligdag)"
-_OPEN_SENT = re.compile(r"(?i)\b(?:åpningstid\w*|telefontid\w*|åpen|åpent|stengt|drop-?in)\b")
+_OPEN_SENT = re.compile(r"(?i)\b(?:åpningstid\w*|telefontid\w*|åpen|åpent|åpne|stengt|drop[\s-]?in)\b")
 
 
 def strip_contact(text):
@@ -620,7 +620,7 @@ def context(docs):
         blocks.append(
             f"KILDE [{i}]\nTittel: {doc.get('tittel') or ''}\n"
             f"URL: {doc.get('url') or ''}\nKommune: {doc.get('kommune') or ''}\n"
-            f"Tema: {doc.get('tema') or ''}\nType: {doc.get('informasjonstype') or ''}\n"
+            f"Tema: {strip_contact(doc.get('tema'))}\nType: {doc.get('informasjonstype') or ''}\n"
             f"Sidetype: {page_type(doc.get('url'))}\n"
             f"{('Oppsummering: ' + summary + chr(10) + 'Utdrag: ' + excerpt)[:MAX_CONTEXT_CHARS]}"
         )
@@ -690,6 +690,8 @@ SYSTEM_PROMPT = (
     "Fokuser pa hva tjenesten tilbyr, hvem den gjelder for, og dokumenterte vilkar. "
     "Hvis brukeren ber om kontaktinformasjon, vis til originaldokumentet "
     "via kildehenvisning i stedet for a gjengi detaljene. "
+    "Kontaktinformasjon og åpningstider er fjernet fra kildene med vilje: "
+    "ikke kommenter at de mangler, og ikke nevn ukedager for åpent eller drop-in. "
     "Bruk korte avsnitt og unngå gjentakelser. "
 
     "SVARLENGDE: "
