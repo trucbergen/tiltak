@@ -621,6 +621,24 @@ def strip_contact(text):
     return re.sub(r"\s{2,}", " ", t).strip()
 
 
+def renumber_sources(answer, docs, n_ai=AI_SOURCES):
+    """Nummerer kildene i den rekkefoelgen svaret bruker dem: [4] [1] [5] -> [1] [2] [3].
+    Brukte kilder flyttes foerst og merkes (_brukt). Ingen dokumenter forsvinner."""
+    order = []
+    for m in re.finditer(r"\[(\d+)\]", answer or ""):
+        n = int(m.group(1))
+        if 1 <= n <= min(len(docs), n_ai) and n not in order:
+            order.append(n)
+    if not order:
+        return answer, docs
+    new_nr = {old: new for new, old in enumerate(order, 1)}
+    answer = re.sub(r"\[(\d+)\]",
+                    lambda m: f"[{new_nr[int(m.group(1))]}]" if int(m.group(1)) in new_nr else m.group(0), answer)
+    used = [dict(docs[o - 1], _brukt=True) for o in order]
+    rest = [d for i, d in enumerate(docs, 1) if i not in new_nr]
+    return answer, used + rest
+
+
 def context(docs):
     blocks = []
     for i, doc in enumerate(docs, 1):
@@ -999,7 +1017,8 @@ def render_documents(docs, total, key):
     for i, doc in enumerate(docs[first:last], first + 1):
         with st.container(border=True):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
-            st.markdown(f"**{doc.get('_nr', i)}. {title}**")   # samme nummer som [n] i svaret
+            merke = "  :green[✓ Brukt i svaret]" if doc.get("_brukt") else ""
+            st.markdown(f"**{i}. {title}**{merke}")
             sti = page_path(doc.get("url"))
             st.caption(" · ".join(x for x in [page_type(doc.get("url")), sti,
                                               doc.get("dokumentdato") or "Udatert"] if x))
@@ -1028,22 +1047,11 @@ def render_assistant(message, idx, show_feedback=True):
     if docs:
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
-        # Kildene svaret faktisk viser til ([1], [4] ...) vises foerst, med samme nummer.
-        # Resten av treffene ligger samlet under «Flere dokumenter».
-        numbered = [dict(d, _nr=n) for n, d in enumerate(docs, 1)]
-        cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", message.get("content") or "")
-                        if 1 <= int(n) <= len(docs)})
-        if cited:
-            brukt = [numbered[n - 1] for n in cited]
-            andre = [d for d in numbered if d["_nr"] not in cited]
-            with st.expander(f"📄 Kilder brukt i svaret ({len(brukt)})", expanded=False):
-                render_documents(brukt, len(brukt), f"{idx}_brukt")
-            if andre:
-                with st.expander(f"Flere dokumenter som ble funnet ({len(andre)})"):
-                    render_documents(andre, len(andre), f"{idx}_andre")
-        else:
-            with st.expander(f"📄 Kilder ({len(docs)} mest relevante dokumenter)"):
-                render_documents(numbered, len(docs), str(idx))
+        with st.expander(f"📄 Kilder ({len(docs)})"):
+            if any(d.get("_brukt") for d in docs):
+                st.caption("Kildene merket «✓ Brukt i svaret» står først, med samme nummer som [1], [2] … "
+                           "i teksten. De andre inneholder søkeordene, men svaret bygger ikke på dem.")
+            render_documents(docs, len(docs), str(idx))
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1143,6 +1151,8 @@ if question and question.strip():
                     else:
                         answer = ("Det oppstod en feil da svaret skulle lages. "
                                   "Dokumentene som ble funnet, ligger under Kilder.")
+        if docs and not hide_sources:
+            answer, docs = renumber_sources(answer, docs)
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
         message = {"role": "assistant", "content": answer, "sources": [] if hide_sources else docs[:SHOW_SOURCES], "total": total,
