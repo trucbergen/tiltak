@@ -591,13 +591,18 @@ def diversify(docs, first_n=SHOW_SOURCES, max_per_group=MAX_PER_GROUP):
 # ---------------------------------------------------------------------------
 _EMAIL = re.compile(r"\S+@\S+\.\w+")
 _PHONE = re.compile(r"(?<!\d)(?:\+47[\s-]?)?(?:\d{2}[\s-]?){3}\d{2}(?!\d)|(?<!\d)\d{3}[\s-]\d{2}[\s-]\d{3}(?!\d)")
-_TIME = re.compile(r"(?i)\b(?:kl(?:okken|\.)?\s*)?\d{1,2}[.:]\d{2}(?:\s*[-–]\s*\d{1,2}[.:]\d{2})?\b")
-_DAYS = r"(?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag|hverdag|helg|helligdag)"
+_TIME = re.compile(
+    r"(?i)\b(?:kl(?:okken|\.)?\s*)?\d{1,2}[.:]\d{2}(?:\s*[-–]\s*\d{1,2}[.:]\d{2})?\b"   # 14.00-17.00
+    r"|\bkl(?:okken|\.)?\s*\d{1,2}(?:\s*[-–]\s*\d{1,2})?\b"                              # kl 14-17
+    r"|\b\d{1,2}\s*[-–]\s*\d{1,2}\b(?!\s*(?:år|%|prosent|uker|måneder|dager|timer|elever|personer))")  # 14-17, ikke 13-23 år
+_DAYS = (r"(?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag|hverdag|helg|helligdag"
+         r"|\b(?:man|tirs|ons|tors|fre|lør|søn)\.?\s*(?:og|,|-|–|til)\s*(?:man|tirs|ons|tors|fre|lør|søn)\b)")  # «man og ons»
 _OPEN_SENT = re.compile(r"(?i)\b(?:åpningstid\w*|telefontid\w*|åpen|åpent|åpne|stengt|drop[\s-]?in)\b")
 
 
 def strip_contact(text):
     t = str(text or "")
+    t = re.sub(r"(?i)\bkl\.\s*", "kl ", t)          # «kl.» er ikke slutt paa en setning
     sentences = re.split(r"(?<=[.!?])\s+", t)
     # Hele setninger med aapningstider, telefonnummer eller e-post tas bort.
     keep = [x for x in sentences
