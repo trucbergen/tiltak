@@ -154,13 +154,25 @@ SPELL_CUTOFF = 0.8       # hvor likt ordet maa vaere (0-1)
 @st.cache_resource(show_spinner=False)
 def fts_vocabulary(path, mtime):
     """{ord: antall dokumenter} for alle ord i minst 2 dokumenter, + sortert liste for prefikssjekk."""
-    try:
+    terms = {}
+    try:   # 1) ordlisten i soekeindeksen (hele teksten)
         with sqlite3.connect(f"file:{quote(str(path), safe='/:')}?mode=ro", uri=True) as con:
             con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab "
                         "USING fts5vocab(main, 'documents_fts_full', 'row')")
             terms = dict(con.execute("SELECT term, doc FROM temp.vocab WHERE doc >= 2").fetchall())
-    except sqlite3.Error:
-        terms = {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[stavekontroll] fts5vocab feilet: {type(exc).__name__}: {exc}", file=sys.stderr)
+    if not terms:  # 2) reserve: ord fra titler, tema, noekkelord og utdrag i documents-tabellen
+        from collections import Counter
+        count = Counter()
+        try:
+            with connect() as con:
+                for row in con.execute("SELECT tittel, tema, nokkelord, oppsummering, tekstutdrag FROM documents"):
+                    count.update(set(_fold(w) for w in re.findall(r"[^\W\d_]+", " ".join(str(x or "") for x in row))))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[stavekontroll] reserve feilet: {type(exc).__name__}: {exc}", file=sys.stderr)
+        terms = {w: n for w, n in count.items() if n >= 2}
+    print(f"[stavekontroll] {len(terms)} ord i ordlisten", file=sys.stderr)
     return terms, sorted(terms)
 
 
