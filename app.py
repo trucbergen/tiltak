@@ -65,7 +65,7 @@ MAX_CONTEXT_CHARS = 1900
 # gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
 GROQ_MAX_OUTPUT_TOKENS = 4000
 GROQ_REASONING_EFFORT = "low"  # gpt-oss: low / medium / high
-STOPWORDS = set("hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
+STOPWORDS = set("skjer skjera hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
 st.markdown("""<style>
 .block-container {max-width: 860px; padding-top: 2.2rem; padding-bottom: 5rem;}
@@ -999,7 +999,7 @@ def render_documents(docs, total, key):
     for i, doc in enumerate(docs[first:last], first + 1):
         with st.container(border=True):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
-            st.markdown(f"**{i}. {title}**")
+            st.markdown(f"**{doc.get('_nr', i)}. {title}**")   # samme nummer som [n] i svaret
             sti = page_path(doc.get("url"))
             st.caption(" · ".join(x for x in [page_type(doc.get("url")), sti,
                                               doc.get("dokumentdato") or "Udatert"] if x))
@@ -1028,8 +1028,22 @@ def render_assistant(message, idx, show_feedback=True):
     if docs:
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
-        with st.expander(f"📄 Kilder ({len(docs)} mest relevante dokumenter)"):
-            render_documents(docs, len(docs), str(idx))
+        # Kildene svaret faktisk viser til ([1], [4] ...) vises foerst, med samme nummer.
+        # Resten av treffene ligger samlet under «Flere dokumenter».
+        numbered = [dict(d, _nr=n) for n, d in enumerate(docs, 1)]
+        cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", message.get("content") or "")
+                        if 1 <= int(n) <= len(docs)})
+        if cited:
+            brukt = [numbered[n - 1] for n in cited]
+            andre = [d for d in numbered if d["_nr"] not in cited]
+            with st.expander(f"📄 Kilder brukt i svaret ({len(brukt)})", expanded=False):
+                render_documents(brukt, len(brukt), f"{idx}_brukt")
+            if andre:
+                with st.expander(f"Flere dokumenter som ble funnet ({len(andre)})"):
+                    render_documents(andre, len(andre), f"{idx}_andre")
+        else:
+            with st.expander(f"📄 Kilder ({len(docs)} mest relevante dokumenter)"):
+                render_documents(numbered, len(docs), str(idx))
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
