@@ -2,10 +2,6 @@
 Hybrid sok: SQLite FTS5 (nokkelord) + semantisk sok (nomic-embed-text-vektorer
 fra bergen_vec.db), slatt sammen med Reciprocal Rank Fusion.
 VANLIG VISNING for testere: bare Groq, alltid hybrid sok, ingen tekniske detaljer.
-v2: dynamisk kommune (KOMMUNE i Secrets/miljoe -> <slug>_db.db og <slug>_vec.db),
-    sidetype og bydel fra databasen (kolonnene sidetype, bydeler, bydel_omfang, geografi),
-    bydel og geografi sendes til modellen og vises i kildekortene.
-    Virker ogsaa med gammel database uten de nye kolonnene.
 (Utviklerversjonen med modellvalg, sokemetode og diagnose ligger i app_utvikler.py.)
 Secrets: GROQ_API_KEY.
 """
@@ -27,17 +23,10 @@ from urllib.parse import quote
 import streamlit as st
 
 st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="centered")
-# Kommune: KOMMUNE i Streamlit Secrets (rotnivaa) eller miljoevariabel. Standard: bergen.
-# Filene ligger i samme mappe som app.py: <kommune>_db.db og <kommune>_vec.db (fra 08 og 08b).
-def _slug(x):
-    import unicodedata
-    x = unicodedata.normalize("NFKD", str(x).lower()).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]+", "_", x).strip("_")
-KOMMUNE = os.environ.get("KOMMUNE", "bergen")
-KOMMUNE_NAVN = KOMMUNE[:1].upper() + KOMMUNE[1:]
-DB_PATH = Path(__file__).resolve().parent / f"{_slug(KOMMUNE)}_db.db"
-# Vektorfil fra 08b_vektorer.R. Mangler den, brukes bare nokkelordsok.
-VEC_PATH = Path(__file__).resolve().parent / f"{_slug(KOMMUNE)}_vec.db"
+# Databasen ligger i samme mappe som app.py (lokalt og i Streamlit Cloud).
+DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
+# Vektorfil fra 09_bergen_vektorer.R. Mangler den, brukes bare nokkelordsok.
+VEC_PATH = Path(__file__).resolve().parent / "bergen_vec.db"
 # Samme modell som Ollama "nomic-embed-text" (v1.5), kjort via fastembed/ONNX.
 # "-Q" er kvantisert (0,13 GB). Full modell (0,52 GB) gaar tom for minne i
 # Streamlit Cloud. Diagnosen viser hvor godt -Q samsvarer med Ollama-vektorene.
@@ -149,64 +138,12 @@ def db_count(path, mtime):
         return con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
 
-BASE_COLS = ["doc_id", "tittel", "url", "oppsummering", "tekstutdrag", "tema", "malgruppe",
-             "informasjonstype", "kommune", "dokumentdato"]
-NEW_COLS = ["sidetype", "bydeler", "bydel_omfang", "geografi"]
-FALLBACK_PLACES = ["åsane", "arna", "fana", "ytrebygda", "laksevåg", "fyllingsdalen", "årstad", "bergenhus"]
-
-
-@st.cache_data(show_spinner=False)
-def db_schema(path, mtime):
-    """Hvilke kolonner finnes, og oppslag sted -> bydel (fra tabellen bydel_steder)."""
-    with connect() as con:
-        cols = {r[1] for r in con.execute("PRAGMA table_info(documents)")}
-        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        places = {}
-        if "bydel_steder" in tables:
-            places = {str(s).lower(): str(b) for s, b in con.execute("SELECT sted, bydel FROM bydel_steder")}
-        elif "bydeler" in cols:
-            for (b,) in con.execute("SELECT DISTINCT bydeler FROM documents WHERE coalesce(bydeler,'')<>''"):
-                for x in str(b).split(";"):
-                    if x.strip():
-                        places[x.strip().lower()] = x.strip()
-    if not places:
-        places = {p: p[:1].upper() + p[1:] for p in FALLBACK_PLACES}
-    return {"cols": sorted(cols), "places": places}
-
-
-def schema():
-    return db_schema(str(DB_PATH), DB_PATH.stat().st_mtime_ns)
-
-
-def has_col(name):
-    return name in schema()["cols"]
-
-
-def doc_cols(prefix=""):
-    return ",".join(prefix + c for c in BASE_COLS + [c for c in NEW_COLS if has_col(c)])
-
-
-def find_places(question):
-    """Finn stedsnavn i spoersmaalet (ogsaa flerords, f.eks. «Indre Arna»).
-    Returnerer (bydeler, stedsord som skal fjernes fra soeket)."""
-    q = question.lower()
-    bydeler, words = [], set()
-    for sted in sorted(schema()["places"], key=len, reverse=True):
-        if re.search(r"(?<![\w])" + re.escape(sted) + r"s?(?![\w])", q):
-            b = schema()["places"][sted]
-            if b not in bydeler:
-                bydeler.append(b)
-            words.update(re.findall(r"[^\W_]+", sted))
-            q = re.sub(re.escape(sted), " ", q)
-    return bydeler, words
-
-
 def words_from_question(question):
     words = re.findall(r"[^\W_]+", question.lower(), flags=re.UNICODE)
     return list(dict.fromkeys(w for w in words if len(w) >= 2 and w not in STOPWORDS))[:12]
 
 
-# Reserve naar databasen mangler kolonnen sidetype (gammel eksport): sidetype fra URL.
+# Sidetype leses fra URL-en (samme inndeling som bergen.kommune.no).
 SIDETYPER = [
     ("/innbyggerhjelpen/", "Tjenester"),
     ("/hvaskjer/", "Nyheter og aktuelt"),
@@ -216,9 +153,7 @@ SIDETYPER = [
 SERVICE_BONUS = 4  # ekstra vekt for tjenestesider i rangeringen
 
 
-def page_type(url, doc=None):
-    if doc and doc.get("sidetype"):
-        return doc["sidetype"]
+def page_type(url):
     url = str(url or "")
     for part, label in SIDETYPER:
         if part in url:
@@ -235,6 +170,8 @@ def page_path(url, depth=2):
 
 
 # Stedsnavn er valgfrie: de gir ekstra vekt, men er ikke et krav i soeket.
+PLACE_NAMES = {"åsane", "arna", "fana", "ytrebygda", "laksevåg", "fyllingsdalen", "årstad",
+               "bergenhus", "sentrum"}
 PLACE_BONUS = 8
 PREFIX_MIN = 5  # ord med minst 5 bokstaver soekes som prefiks (bybane -> bybane*)
 
@@ -246,18 +183,11 @@ def _like_any_case(field, word):
             ["%" + word + "%", "%" + cap + "%"])
 
 
-def service_bonus_sql():
-    if has_col("sidetype"):
-        return f"(CASE WHEN d.sidetype = 'Tjenester' THEN {SERVICE_BONUS} ELSE 0 END)"
-    return f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)"
-
-
 def search_documents(question):
     """FTS5: presist sok forst, deretter minst to sentrale soketermer.
 
     - Ord med minst PREFIX_MIN bokstaver soekes som prefiks (boeyning/sammensetning).
-    - Steder (bydel eller strok, f.eks. Tertnes -> Åsane) er valgfrie og gir ekstra vekt
-      naar dokumentets bydel-kolonne matcher (PLACE_BONUS).
+    - Bydeler er valgfrie og gir ekstra vekt (PLACE_BONUS).
     - Felt-vekt telles ikke dobbelt for sammensatte ord (eldre + omsorg i «eldreomsorg»).
     Returnerer (dokumenter, antall_treff, sokemodus).
     """
@@ -267,38 +197,47 @@ def search_documents(question):
     if not all_words:
         return [], 0, "INGEN"
 
+    # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
     generic = {
         "bergen", "bergens", "dokument", "dokumenter", "dokumentasjon",
         "informasjon", "opplysninger", "kommunale", "kommunal", "eksempel",
         "eksempler", "sammenlign", "forklar", "sporsmal", "spørsmål",
         "oppgi", "kilder", "kilde", "aktuelle", "mulige", "spesifikke",
-        _slug(KOMMUNE), KOMMUNE.lower(),
     }
-    places, place_words = find_places(question)
-    words = [w for w in all_words if w not in place_words and w not in {"bergen", "bergens", KOMMUNE.lower()}]
-    if not words:  # bare stedsnavn: soek paa dem
+    places = [w for w in all_words if w in PLACE_NAMES]
+    words = [w for w in all_words if w not in PLACE_NAMES and w not in {"bergen", "bergens"}]
+    if not words:  # bare stedsnavn (eller «Bergen»): soek paa dem
         words, places = all_words, []
     important = [w for w in words if w not in generic and not w.isdigit()]
     if not important:
         important = [w for w in words if w not in generic] or words
+
+    # Lengre fagord har ofte stor verdi, men behold ogsa noen korte ord.
     core = sorted(important, key=lambda w: (-len(w), words.index(w)))[:6]
 
     def quote_word(w):
         star = "*" if len(w) >= PREFIX_MIN else ""
         return '"' + w.replace('"', '') + '"' + star
 
+    # Soketrinn: alle ord, de viktigste tre, sa minst to av de fem viktigste.
     queries = [("AND", " AND ".join(map(quote_word, words)))]
     if len(core) >= 3:
         queries.append(("KJERNE", " AND ".join(map(quote_word, core[:3]))))
     if len(core) >= 2:
         pairs = list(combinations(core[:5], 2))
-        queries.append(("MINST_2", " OR ".join(
-            "(" + quote_word(x) + " AND " + quote_word(y) + ")" for x, y in pairs)))
+        pair_query = " OR ".join(
+            "(" + quote_word(x) + " AND " + quote_word(y) + ")"
+            for x, y in pairs
+        )
+        queries.append(("MINST_2", pair_query))
     elif len(core) == 1:
         queries.append(("ETT_FAGORD", quote_word(core[0])))
 
+    # FTS5 bm25: lavere verdi er bedre. Tittel, tema og malgruppe
+    # prioriteres, men selve dokumentteksten teller fortsatt.
     bm25 = "bm25(documents_fts_full, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
     bonus_parts, bonus_params = [], []
+    # Full vekt for forste soekeord som treffer feltet, litt mer per ekstra ord.
     for field, first, extra in (("d.tittel", 6, 2), ("d.tema", 4, 1), ("d.malgruppe", 3, 1)):
         cases, params = [], []
         for word in core[:5]:
@@ -310,23 +249,21 @@ def search_documents(question):
             bonus_parts.append(f"({first} * min({n}, 1) + {extra} * max({n} - 1, 0))")
             bonus_params += params + params
     for place in places:
-        if has_col("bydeler"):
-            bonus_parts.append(f"(CASE WHEN coalesce(d.bydeler,'') LIKE ? THEN {PLACE_BONUS} ELSE 0 END)")
-            bonus_params.append("%" + place + "%")
-        else:
-            conds, prm = [], []
-            for field in ("d.tittel", "d.oppsummering", "d.malgruppe", "d.tekstutdrag"):
-                c, p = _like_any_case(field, place.lower())
-                conds.append(c)
-                prm += p
-            bonus_parts.append(f"(CASE WHEN {' OR '.join(conds)} THEN {PLACE_BONUS} ELSE 0 END)")
-            bonus_params += prm
-    bonus_parts.append(service_bonus_sql())
+        conds, prm = [], []
+        for field in ("d.tittel", "d.oppsummering", "d.malgruppe", "d.tekstutdrag"):
+            c, p = _like_any_case(field, place)
+            conds.append(c)
+            prm += p
+        bonus_parts.append(f"(CASE WHEN {' OR '.join(conds)} THEN {PLACE_BONUS} ELSE 0 END)")
+        bonus_params += prm
+    bonus_parts.append(f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)")
     bonus_sql = " + ".join(bonus_parts) or "0"
 
-    sql = f"""SELECT {doc_cols('d.')}, {bm25} AS score
+    sql = f"""SELECT d.doc_id,d.tittel,d.url,d.oppsummering,d.tekstutdrag,
+                      d.tema,d.malgruppe,d.informasjonstype,d.kommune,d.dokumentdato,
+                      {bm25} AS score
                FROM documents_fts_full
-               JOIN documents d ON d.doc_id=documents_fts_full.rowid
+               JOIN documents d ON d.rowid=documents_fts_full.rowid
                WHERE documents_fts_full MATCH ?
                ORDER BY ({bm25} - ({bonus_sql})),d.doc_id LIMIT ?"""
 
@@ -339,7 +276,74 @@ def search_documents(question):
             ).fetchone()[0]
             if total == 0:
                 continue
-            rows = con.execute(sql, (expr, *bonus_params, MAX_LIST_RESULTS)).fetchall()
+            rows = con.execute(
+                sql, (expr, *bonus_params, MAX_LIST_RESULTS)
+            ).fetchall()
+            return [dict(row) for row in rows], total, mode
+    return [], 0, "INGEN"
+
+    # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
+    generic = {
+        "bergen", "bergens", "dokument", "dokumenter", "dokumentasjon",
+        "informasjon", "opplysninger", "kommunale", "kommunal", "eksempel",
+        "eksempler", "sammenlign", "forklar", "sporsmal", "spørsmål",
+        "oppgi", "kilder", "kilde", "aktuelle", "mulige", "spesifikke",
+    }
+    important = [w for w in words if w not in generic and not w.isdigit()]
+    if not important:
+        important = [w for w in words if w not in generic] or words
+
+    # Lengre fagord har ofte stor verdi, men behold ogsa noen korte ord.
+    core = sorted(important, key=lambda w: (-len(w), words.index(w)))[:6]
+    quote_word = lambda w: '"' + w.replace('"', '') + '"'
+
+    # Soketrinn: alle ord, de viktigste tre, sa minst to av de fem viktigste.
+    queries = [("AND", " AND ".join(map(quote_word, words)))]
+    if len(core) >= 3:
+        queries.append(("KJERNE", " AND ".join(map(quote_word, core[:3]))))
+    if len(core) >= 2:
+        pairs = list(combinations(core[:5], 2))
+        pair_query = " OR ".join(
+            "(" + quote_word(x) + " AND " + quote_word(y) + ")"
+            for x, y in pairs
+        )
+        queries.append(("MINST_2", pair_query))
+    elif len(core) == 1:
+        queries.append(("ETT_FAGORD", quote_word(core[0])))
+
+    # FTS5 bm25: lavere verdi er bedre. Tittel, tema og malgruppe
+    # prioriteres, men selve dokumentteksten teller fortsatt.
+    bm25 = "bm25(documents_fts_full, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
+    bonus_parts, bonus_params = [], []
+    for word in core[:5]:
+        for field, weight in (("tittel", 6), ("tema", 4), ("malgruppe", 3)):
+            bonus_parts.append(
+                f"(CASE WHEN lower(coalesce(d.{field},'')) LIKE ? THEN {weight} ELSE 0 END)"
+            )
+            bonus_params.append("%" + word + "%")
+    bonus_parts.append(f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)")
+    bonus_sql = " + ".join(bonus_parts) or "0"
+
+    sql = f"""SELECT d.doc_id,d.tittel,d.url,d.oppsummering,d.tekstutdrag,
+                      d.tema,d.malgruppe,d.informasjonstype,d.kommune,d.dokumentdato,
+                      {bm25} AS score
+               FROM documents_fts_full
+               JOIN documents d ON d.rowid=documents_fts_full.rowid
+               WHERE documents_fts_full MATCH ?
+               ORDER BY ({bm25} - ({bonus_sql})),d.doc_id LIMIT ?"""
+
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        for mode, expr in queries:
+            total = con.execute(
+                "SELECT COUNT(*) FROM documents_fts_full WHERE documents_fts_full MATCH ?",
+                (expr,),
+            ).fetchone()[0]
+            if total == 0:
+                continue
+            rows = con.execute(
+                sql, (expr, *bonus_params, MAX_LIST_RESULTS)
+            ).fetchall()
             return [dict(row) for row in rows], total, mode
     return [], 0, "INGEN"
 
@@ -487,7 +491,8 @@ def fetch_documents(doc_ids):
     with connect() as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            f"""SELECT {doc_cols()}
+            f"""SELECT doc_id,tittel,url,oppsummering,tekstutdrag,tema,malgruppe,
+                       informasjonstype,kommune,dokumentdato
                 FROM documents WHERE doc_id IN ({marks})""", list(doc_ids)).fetchall()
     by_id = {r["doc_id"]: dict(r) for r in rows}
     return [by_id[d] for d in doc_ids if d in by_id]
@@ -508,35 +513,7 @@ def rrf_merge(*rankings, k=RRF_K):
     return sorted(scores, key=lambda d: (-round(scores[d], 12), first_rank.get(d, 10**9), d))
 
 
-# Omraade i rangeringen (samme ide som stedsvekt i Shiny):
-#  - Spoersmaalet nevner et sted (Åsane, Tertnes ...): dokumenter med det omraadet flyttes opp.
-#  - Ingen sted i spoersmaalet: sider som gjelder bare ETT omraade (f.eks. «Sandsli helsestasjon»)
-#    flyttes ned, saa oversikts- og tjenestesider for hele kommunen kommer foerst.
-AREA_UP = 5     # antall plasser opp ved treff paa riktig omraade
-AREA_DOWN = 5   # antall plasser ned for enkeltomraade-sider naar intet sted er nevnt
-
-
-def area_rerank(docs, question):
-    if not docs or not has_col("bydeler"):
-        return docs
-    places, _ = find_places(question)
-
-    def key(item):
-        pos, d = item
-        omr = str(d.get("bydeler") or "")
-        if places:
-            return pos - (AREA_UP + 0.5 if any(p in omr for p in places) else 0)
-        return pos + (AREA_DOWN + 0.5 if d.get("bydel_omfang") == "en" else 0)
-    return [d for _, d in sorted(enumerate(docs), key=lambda it: (key(it), it[0]))]
-
-
 def run_search(question, method):
-    """Soek og ranger, deretter juster rekkefoelgen etter omraade (area_rerank)."""
-    docs, total, mode, note = _run_search(question, method)
-    return area_rerank(docs, question), total, mode, note
-
-
-def _run_search(question, method):
     """Returner (dokumenter, antall, modus-tekst, merknad) for valgt sokemetode."""
     if method == "Nøkkelord" or not vectors_available():
         docs, total, mode = search_documents(question)
@@ -569,31 +546,8 @@ def _run_search(question, method):
         d["kilde_sok"] = ("begge" if d["doc_id"] in fts_set and d["doc_id"] in sem_score
                           else "nøkkelord" if d["doc_id"] in fts_set else "semantisk")
     floor = min(sem_score.values(), default=0)
-    return docs, max(fts_total, len(docs)), (f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk "
+    return docs, len(docs), (f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk "
                              f"({len(sem_ids)} med likhet ≥ {floor:.2f})"), None
-
-
-def area_text(doc):
-    """Omraade (bydel / tidligere kommune / tettsted). Tom streng hvis ingen - da vises ingenting."""
-    return str(doc.get("bydeler") or "").strip()   # vis alt som finnes
-
-
-def bydel_text(doc):
-    """Lesbar bydel for modellen. Tom streng hvis kolonnen mangler."""
-    omfang = str(doc.get("bydel_omfang") or "")
-    bydeler = str(doc.get("bydeler") or "").strip()
-    if not omfang and not bydeler:
-        return ""
-    if omfang == "ingen" or not bydeler:
-        return "ikke knyttet til en bestemt bydel"
-    if omfang == "hele kommunen":
-        return f"mange bydeler / hele kommunen ({bydeler})"
-    return bydeler
-
-
-def geo_text(doc):
-    g = str(doc.get("geografi") or "").strip()
-    return "" if g.lower() in ("", "ukjent", "ingen") else g
 
 
 def context(docs):
@@ -601,19 +555,13 @@ def context(docs):
     for i, doc in enumerate(docs, 1):
         summary = str(doc.get("oppsummering") or "")
         excerpt = str(doc.get("tekstutdrag") or "")
-        lines = [
-            f"KILDE [{i}]",
-            f"Tittel: {doc.get('tittel') or ''}",
-            f"URL: {doc.get('url') or ''}",
-            f"Kommune: {doc.get('kommune') or ''}",
-            f"Tema: {doc.get('tema') or ''}",
-            f"Type: {doc.get('informasjonstype') or ''}",
-            f"Sidetype: {page_type(doc.get('url'), doc)}",
-        ]
-        if bydel_text(doc):
-            lines.append(f"Område: {bydel_text(doc)}")
-        lines.append(("Oppsummering: " + summary + "\n" + "Utdrag: " + excerpt)[:MAX_CONTEXT_CHARS])
-        blocks.append("\n".join(lines))
+        blocks.append(
+            f"KILDE [{i}]\nTittel: {doc.get('tittel') or ''}\n"
+            f"URL: {doc.get('url') or ''}\nKommune: {doc.get('kommune') or ''}\n"
+            f"Tema: {doc.get('tema') or ''}\nType: {doc.get('informasjonstype') or ''}\n"
+            f"Sidetype: {page_type(doc.get('url'))}\n"
+            f"{('Oppsummering: ' + summary + chr(10) + 'Utdrag: ' + excerpt)[:MAX_CONTEXT_CHARS]}"
+        )
     return "\n\n".join(blocks)
 
 
@@ -640,9 +588,6 @@ SYSTEM_PROMPT = (
     "med mindre kilden nevner bydelen eksplisitt. Spør brukeren om en bydel og "
     "kildene bare gjelder hele Bergen, si det tydelig, f.eks. «Kildene beskriver "
     "tilbud for hele Bergen, ikke spesifikt for Åsane». "
-    "Feltet «Område» i hver kilde (bydel, tidligere kommune eller tettsted) er hentet automatisk "
-    "fra stedsnavn i dokumentet: bruk det til å avgjøre om en kilde gjelder et bestemt område. "
-    "«ikke knyttet til en bestemt bydel» betyr at kilden gjelder hele kommunen eller ikke sier noe om sted. "
     "Ikke presenter private tilbud som kommunale tjenester. "
     "Beskriv dokumenterte tilbud som eksempler, "
     "ikke som en fullstendig oversikt. "
@@ -977,17 +922,9 @@ def render_documents(docs, total, key):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
             st.markdown(f"**{i}. {title}**")
             sti = page_path(doc.get("url"))
-            # Linje 1: hvor/naar/hva. Linje 2 (etter oppsummering): hvem/tema.
-            st.caption(" · ".join(x for x in [
-                page_type(doc.get("url"), doc), sti,
-                ("Område: " + area_text(doc)) if area_text(doc) else "",
-                doc.get("dokumentdato") or "Udatert"] if x))
+            st.caption(" · ".join(x for x in [page_type(doc.get("url")), sti,
+                                              doc.get("dokumentdato") or "Udatert"] if x))
             st.text(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
-            linje2 = " · ".join(x for x in [
-                ("Målgruppe: " + str(doc["malgruppe"])) if str(doc.get("malgruppe") or "").lower() not in ("", "ukjent") else "",
-                ("Tema: " + str(doc["tema"])) if str(doc.get("tema") or "").lower() not in ("", "ukjent") else ""] if x)
-            if linje2:
-                st.caption(linje2)
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
@@ -1010,15 +947,8 @@ def render_assistant(message, idx, show_feedback=True):
     st.markdown(message.get("content") or "Ingen svar.")
     docs = message.get("sources") or []
     if docs:
-        total = max(int(message.get("total") or 0), len(docs))
-        brukt = min(AI_SOURCES, len(docs))
-        st.caption(
-            f"Fant {total} dokumenter. Svaret bygger på de {brukt} mest relevante, "
-            f"og de {len(docs)} beste vises under Kilder. Kontroller alltid kildene.",
-            help=("Chatboten finner omtrent like mange dokumenter som dokumentsøket, men viser bare "
-                  f"de {SHOW_SOURCES} beste og lar AI-modellen lese de {AI_SOURCES} beste. Det er bevisst: "
-                  "modellen kan ikke lese over hundre dokumenter og samtidig gi et godt, kort svar. "
-                  "Dokumentsøket viser alle treff, også fra sammenfoldede avsnitt, nyheter og PDF-er."))
+        st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
+        total = message.get("total", len(docs))
         with st.expander(f"📄 Kilder ({len(docs)} mest relevante dokumenter)"):
             render_documents(docs, len(docs), str(idx))
     answer_id = message.get("id")
