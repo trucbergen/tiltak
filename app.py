@@ -602,6 +602,7 @@ def strip_contact(text):
     # Hele setninger med aapningstider, telefonnummer eller e-post tas bort.
     keep = [x for x in sentences
             if not (_OPEN_SENT.search(x) and (re.search(_DAYS, x, re.I) or _TIME.search(x)))
+            and not (re.search(_DAYS, x, re.I) and _TIME.search(x))   # f.eks. «Mandag: 14.00-17.00»
             and not _EMAIL.search(x) and not _PHONE.search(x)]
     t = " ".join(keep)
     t = _EMAIL.sub("", t)
