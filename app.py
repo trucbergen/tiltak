@@ -142,6 +142,59 @@ def db_count(path, mtime):
         return con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
 
 
+# ---------------------------------------------------------------------------
+# Stavekontroll: ord som ikke finnes i dokumentene, rettes til naermeste ord som finnes
+# («helsestasjn» -> «helsestasjon»). Ordlisten hentes fra selve soekeindeksen (fts5vocab),
+# saa den passer automatisk for hver kommune og oppdateres med databasen.
+# ---------------------------------------------------------------------------
+SPELL_MIN_LEN = 5        # kortere ord rettes ikke
+SPELL_CUTOFF = 0.8       # hvor likt ordet maa vaere (0-1)
+
+
+@st.cache_resource(show_spinner=False)
+def fts_vocabulary(path, mtime):
+    """{ord: antall dokumenter} for alle ord i minst 2 dokumenter, + sortert liste for prefikssjekk."""
+    try:
+        with sqlite3.connect(f"file:{quote(str(path), safe='/:')}?mode=ro", uri=True) as con:
+            con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab "
+                        "USING fts5vocab(main, 'documents_fts_full', 'row')")
+            terms = dict(con.execute("SELECT term, doc FROM temp.vocab WHERE doc >= 2").fetchall())
+    except sqlite3.Error:
+        terms = {}
+    return terms, sorted(terms)
+
+
+def _fold(word):
+    """Samme forenkling som soekeindeksen: å -> a, é -> e (æ og ø beholdes)."""
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", word.lower()) if not unicodedata.combining(c))
+
+
+def correct_spelling(question):
+    """Returnerer (rettet spoersmaal, [(feil, rettet), ...])."""
+    import bisect
+    import difflib
+    terms, keys = fts_vocabulary(str(DB_PATH), DB_PATH.stat().st_mtime_ns)
+    if not terms:
+        return question, []
+    fixes = []
+    for word in dict.fromkeys(re.findall(r"[^\W\d_]+", question.lower())):
+        w = _fold(word)
+        if len(w) < SPELL_MIN_LEN or word in STOPWORDS or w in terms:
+            continue
+        i = bisect.bisect_left(keys, w)              # finnes ordet som starten paa et ord? (bybane -> bybanen)
+        if i < len(keys) and keys[i].startswith(w):
+            continue
+        same_start = [k for k in keys[bisect.bisect_left(keys, w[:2]):bisect.bisect_left(keys, w[:2] + "\uffff")]]
+        close = difflib.get_close_matches(w, same_start, n=3, cutoff=SPELL_CUTOFF)
+        if close:
+            best = max(close, key=lambda k: (difflib.SequenceMatcher(None, w, k).ratio(), terms[k]))
+            fixes.append((word, best))
+    for wrong, right in fixes:
+        question = re.sub(rf"(?i)\b{re.escape(wrong)}\b", right, question)
+    return question, fixes
+
+
 def words_from_question(question):
     words = re.findall(r"[^\W_]+", question.lower(), flags=re.UNICODE)
     return list(dict.fromkeys(w for w in words if len(w) >= 2 and w not in STOPWORDS))[:12]
@@ -543,7 +596,9 @@ def run_search(question, method):
         return docs, len(docs), f"Semantisk (likhet ≥ {floor:.2f})", None
     fts_docs, fts_total, fts_mode = search_documents(question)
     fts_ids = [d["doc_id"] for d in fts_docs]
-    if len(words_from_question(question)) <= SHORT_QUERY_WORDS and fts_total >= SHORT_QUERY_MIN_FTS:
+    # Kort spoersmaal: semantisk soek brukes ikke naar noekkelord gir mange treff, og heller ikke
+    # naar de gir 0 (da gir semantisk soek tilfeldige sider som «luftkvalitet» for et feilstavet ord).
+    if len(words_from_question(question)) <= SHORT_QUERY_WORDS and (fts_total >= SHORT_QUERY_MIN_FTS or fts_total == 0):
         sem_ids, sem_score = [], {}
     merged = rrf_merge(fts_ids, sem_ids, weights=[1.0, SEM_WEIGHT])[:MAX_LIST_RESULTS]
     known = {d["doc_id"]: d for d in fts_docs}
@@ -1042,6 +1097,8 @@ def render_documents(docs, total, key):
 
 
 def render_assistant(message, idx, show_feedback=True):
+    if message.get("note"):
+        st.caption("✏️ " + message["note"])
     st.markdown(message.get("content") or "Ingen svar.")
     docs = message.get("sources") or []
     if docs:
@@ -1111,10 +1168,12 @@ for i, message in enumerate(st.session_state.messages):
 question = st.chat_input("Still et spørsmål om kommunale dokumenter ...") or example_clicked
 if question and question.strip():
     question = question.strip()[:1200]
+    asked = question                                   # det brukeren skrev (vises i chatten)
+    question, spell_fixes = correct_spelling(question)  # brukes til soek og svar
     history = list(st.session_state.messages)
-    st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.messages.append({"role": "user", "content": asked})
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(asked)
     with st.chat_message("assistant"):
         try:
             with st.spinner("Søker i dokumentene ..."):
@@ -1156,7 +1215,10 @@ if question and question.strip():
             answer, docs = renumber_sources(answer, docs)
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
-        message = {"role": "assistant", "content": answer, "sources": [] if hide_sources else docs[:SHOW_SOURCES], "total": total,
+        note = ("Søkte på " + ", ".join(f"«{r}»" for _, r in spell_fixes)
+                + " (rettet fra " + ", ".join(f"«{w}»" for w, _ in spell_fixes) + ")") if spell_fixes else ""
+        message = {"role": "assistant", "content": answer, "note": note,
+                   "sources": [] if hide_sources else docs[:SHOW_SOURCES], "total": total,
                    "id": answer_id}
         top = docs[:AI_SOURCES]
         log_event("svar", [
