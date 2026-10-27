@@ -557,11 +557,66 @@ def run_search(question, method):
                              f"({len(sem_ids)} med likhet ≥ {floor:.2f})"), None
 
 
+# ---------------------------------------------------------------------------
+# Spredning av kilder: maks MAX_PER_GROUP dokumenter fra samme del av nettstedet
+# (samme overordnede URL-mappe, f.eks. «omkommunen/avdelinger») blant de foerste.
+# Da kommer oversiktssider med, og ikke bare seks enkelthelsestasjoner.
+# ---------------------------------------------------------------------------
+MAX_PER_GROUP = 2
+
+
+def url_group(url):
+    import urllib.parse
+    parts = [p for p in urllib.parse.urlparse(str(url or "")).path.strip("/").split("/") if p]
+    return "/".join(parts[:-1]) or "/"
+
+
+def diversify(docs, first_n=SHOW_SOURCES, max_per_group=MAX_PER_GROUP):
+    """Samme dokumenter, ny rekkefoelge: de foerste first_n har hoeyst max_per_group per gruppe.
+    Det som skyves ut, kommer rett etter (ingen dokumenter forsvinner)."""
+    picked, deferred, count = [], [], {}
+    for d in docs:
+        g = url_group(d.get("url"))
+        if len(picked) < first_n and count.get(g, 0) < max_per_group:
+            picked.append(d)
+            count[g] = count.get(g, 0) + 1
+        else:
+            deferred.append(d)
+    return picked + deferred
+
+
+# ---------------------------------------------------------------------------
+# Fjern kontaktdetaljer og aapningstider FOER teksten sendes til modellen.
+# Det modellen ikke ser, kan den ikke gjengi (sikrere enn bare en regel i prompten).
+# ---------------------------------------------------------------------------
+_EMAIL = re.compile(r"\S+@\S+\.\w+")
+_PHONE = re.compile(r"(?<!\d)(?:\+47[\s-]?)?(?:\d{2}[\s-]?){3}\d{2}(?!\d)|(?<!\d)\d{3}[\s-]\d{2}[\s-]\d{3}(?!\d)")
+_TIME = re.compile(r"(?i)\b(?:kl(?:okken|\.)?\s*)?\d{1,2}[.:]\d{2}(?:\s*[-–]\s*\d{1,2}[.:]\d{2})?\b")
+_DAYS = r"(?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag|hverdag|helg|helligdag)"
+_OPEN_SENT = re.compile(r"(?i)\b(?:åpningstid\w*|telefontid\w*|åpen|åpent|stengt|drop-?in)\b")
+
+
+def strip_contact(text):
+    t = str(text or "")
+    sentences = re.split(r"(?<=[.!?])\s+", t)
+    # Hele setninger med aapningstider, telefonnummer eller e-post tas bort.
+    keep = [x for x in sentences
+            if not (_OPEN_SENT.search(x) and (re.search(_DAYS, x, re.I) or _TIME.search(x)))
+            and not _EMAIL.search(x) and not _PHONE.search(x)]
+    t = " ".join(keep)
+    t = _EMAIL.sub("", t)
+    t = _PHONE.sub("", t)
+    t = _TIME.sub("", t)
+    t = re.sub(r"\s+([.,;:])", r"\1", t)
+    t = re.sub(r"([.,;:])(\s*[.,;:])+", r"\1", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
 def context(docs):
     blocks = []
     for i, doc in enumerate(docs, 1):
-        summary = str(doc.get("oppsummering") or "")
-        excerpt = str(doc.get("tekstutdrag") or "")
+        summary = strip_contact(doc.get("oppsummering"))
+        excerpt = strip_contact(doc.get("tekstutdrag"))
         blocks.append(
             f"KILDE [{i}]\nTittel: {doc.get('tittel') or ''}\n"
             f"URL: {doc.get('url') or ''}\nKommune: {doc.get('kommune') or ''}\n"
@@ -1024,6 +1079,7 @@ if question and question.strip():
         try:
             with st.spinner("Søker i dokumentene ..."):
                 docs, total, _mode, _note = run_search(question, SEARCH_METHOD)
+                docs = diversify(docs)
         except sqlite3.Error:
             st.error("Søket feilet. Prøv igjen.")
             st.stop()
