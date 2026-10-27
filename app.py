@@ -1051,7 +1051,8 @@ def render_assistant(message, idx, show_feedback=True):
             if any(d.get("_brukt") for d in docs):
                 st.caption("Kildene merket «✓ Brukt i svaret» står først, med samme nummer som [1], [2] … "
                            "i teksten. De andre inneholder søkeordene, men svaret bygger ikke på dem.")
-            render_documents(docs, len(docs), str(idx))
+            # Unik noekkel per svar: ellers arver listen sidenummeret («Viser 6–10») fra et tidligere svar.
+            render_documents(docs, len(docs), str(message.get("id") or idx))
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
