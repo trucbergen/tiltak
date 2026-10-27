@@ -234,6 +234,9 @@ def search_documents(question):
             for x, y in pairs
         )
         queries.append(("MINST_2", pair_query))
+        # Siste trinn: minst ETT av ordene (f.eks. «fritidsklubb Loddefjord» der ingen side
+        # har begge ordene). BM25 rangerer sider med flest og sjeldnest ord oeverst.
+        queries.append(("MINST_1", " OR ".join(map(quote_word, core[:5]))))
     elif len(core) == 1:
         queries.append(("ETT_FAGORD", quote_word(core[0])))
 
@@ -667,6 +670,10 @@ SYSTEM_PROMPT = (
     "bruk dem først når spørsmålet gjelder hva kommunen tilbyr. "
     "Nyheter kan være utdaterte; oppgi dato når du bruker dem. "
 
+    "INGEN RELEVANTE KILDER: "
+    "Hvis ingen av kildene svarer på spørsmålet, start svaret med INGEN_TREFF: "
+    "og skriv deretter én kort setning om at du ikke fant informasjon om dette, "
+    "og foreslå gjerne andre søkeord. Ikke bruk kildehenvisninger, og ikke beskriv hva kildene handler om. "
     "USIKKERHET: "
     "Dersom dokumentene ikke inneholder nok informasjon, "
     "si tydelig hva som mangler. "
@@ -1095,6 +1102,7 @@ if question and question.strip():
             st.stop()
         t0 = time.perf_counter()
         status = "ok"
+        hide_sources = False   # True naar modellen svarer at ingen kilder er relevante
         if not docs:
             status = "ingen_treff"
             answer = ("Jeg fant ingen dokumenter som passer til spørsmålet. "
@@ -1104,6 +1112,15 @@ if question and question.strip():
                 try:
                     answer, _usage = generate(question, docs[:AI_SOURCES], history)
                     answer = normalize_markdown(answer)
+                    # Modellen fant ingenting relevant: vis ikke dokumentene (de er da urelaterte).
+                    first_lines = answer.strip().splitlines()[:3]   # overskrift + foerste punkt
+                    if "INGEN_TREFF" in answer[:200] or any(
+                            re.match(r"(?i)^\W*ingen av (de )?(oppgitte |tilgjengelige )?kildene", ln.strip())
+                            for ln in first_lines):
+                        answer = re.sub(r"(?is)\W*INGEN_TREFF\s*:\s*", "", answer, count=1).strip()
+                        answer = re.sub(r"\s*\[\d+\]", "", answer)
+                        status = "ingen_relevante"
+                        hide_sources = True
                 except Exception as exc:
                     status = f"feil: {type(exc).__name__} {error_status(exc) or ''}".strip()
                     if is_transient(exc):
@@ -1114,7 +1131,7 @@ if question and question.strip():
                                   "Dokumentene som ble funnet, ligger under Kilder.")
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
-        message = {"role": "assistant", "content": answer, "sources": docs[:SHOW_SOURCES], "total": total,
+        message = {"role": "assistant", "content": answer, "sources": [] if hide_sources else docs[:SHOW_SOURCES], "total": total,
                    "id": answer_id}
         top = docs[:AI_SOURCES]
         log_event("svar", [
