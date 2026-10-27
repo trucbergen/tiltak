@@ -58,9 +58,7 @@ GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 6
 SHOW_SOURCES = 10  # antall dokumenter som vises under «Kilder» foerst
-SOURCES_MAX = 50   # «Vis flere treff» kan vise inntil saa mange (10 om gangen)
-# Lenke til dokumentsoeket (Shiny). Settes i Secrets som SOK_URL = "https://..."; tom = ingen lenke.
-SOK_URL = os.environ.get("SOK_URL", "").strip()
+SOURCES_MAX = 50   # inntil saa mange dokumenter i kildelisten (Mest aktuelt + Andre treff)
 # Vage spoersmaal: mange treff spredt over mange deler av nettstedet -> be brukeren avgrense
 VAGUE_MIN_HITS = 100       # minst saa mange noekkelordtreff
 VAGUE_MAX_WORDS = 3        # og hoeyst saa mange innholdsord i spoersmaalet
@@ -68,7 +66,7 @@ VAGUE_MIN_SECTIONS = 5     # treffene fordeler seg paa minst saa mange omraader 
 VAGUE_MAX_SHARE = 0.35     # ... og ingen omraade har mer enn denne andelen
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
-PAGE_SIZE = 5
+PAGE_SIZE = 10  # dokumenter per side i kildelisten
 MAX_CONTEXT_CHARS = 1900
 # gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
 GROQ_MAX_OUTPUT_TOKENS = 4000
@@ -731,6 +729,43 @@ def site_section(url):
     return "/".join(parts[:2]).lower()
 
 
+@st.cache_data(show_spinner=False)
+def place_table(path, mtime):
+    """Sted -> bydel fra tabellen bydel_steder (finnes i nye eksporter). Tom hvis den mangler."""
+    try:
+        with connect() as con:
+            return {str(s).lower(): str(b) for s, b in con.execute("SELECT sted, bydel FROM bydel_steder") if s}
+    except Exception:
+        return {}
+
+
+def local_terms(question):
+    """Steder/bydeler nevnt i spoersmaalet (f.eks. «Åsane», «Tertnes») i smaa bokstaver."""
+    table = place_table(str(DB_PATH), DB_PATH.stat().st_mtime_ns) if DB_PATH.is_file() else {}
+    q = f" {question.lower()} "
+    found = {sted for sted in table if re.search(rf"(?<!\w){re.escape(sted)}s?(?!\w)", q)}
+    return found | {table[s].lower() for s in found}
+
+
+def mentions_place(doc, terms):
+    hay = " ".join(str(doc.get(k) or "") for k in ("tittel", "url", "bydeler")).lower().replace("-", " ")
+    return any(t in hay for t in terms)
+
+
+def split_sources(docs, question):
+    """Del kildene i «Mest aktuelt» (brukt i svaret, lokalt sted, samme omraade) og «Andre treff»."""
+    if not docs:
+        return [], []
+    used = [d for d in docs if d.get("_brukt")]
+    sections = {site_section(d.get("url")) for d in (used or docs[:1])}
+    terms = local_terms(question)
+    rest = [d for d in docs if not d.get("_brukt")]
+    lokal = [d for d in rest if terms and mentions_place(d, terms)]
+    same = [d for d in rest if d not in lokal and site_section(d.get("url")) in sections]
+    andre = [d for d in rest if d not in lokal and d not in same]
+    return used + lokal + same, andre
+
+
 def renumber_sources(answer, docs, n_ai=AI_SOURCES):
     """Nummerer kildene i den rekkefoelgen svaret bruker dem: [4] [1] [5] -> [1] [2] [3].
     Brukte kilder flyttes foerst og merkes (_brukt). Ingen dokumenter forsvinner."""
@@ -1122,17 +1157,15 @@ def clean_summary(text):
     return t or "Ingen beskrivelse"
 
 
-def render_documents(docs, total, key):
+def render_documents(docs, key, start=1):
+    """Viser docs med sidetall (PAGE_SIZE per side). start = nummeret til foerste dokument."""
     if not docs:
         return
-    for i, doc in enumerate(docs, 1):
-        # Skillelinje foran de svakere treffene (bare naar det finnes bedre treff foran)
-        if doc.get("_andre") and i > 1 and not docs[i - 2].get("_andre"):
-            st.markdown("<div style='display:flex;align-items:center;gap:10px;color:#7a8595;"
-                        "font-size:0.85rem;margin:14px 0 2px'><hr style='flex:1;margin:0'>"
-                        "Flere dokumenter med samme ord<hr style='flex:1;margin:0'></div>",
-                        unsafe_allow_html=True)
-            st.caption("Funnet fordi de inneholder søkeordene. Kan handle om noe annet.")
+    pages = (len(docs) + PAGE_SIZE - 1) // PAGE_SIZE
+    sk = f"page_{key}"
+    page = min(max(st.session_state.get(sk, 1), 1), pages)
+    first = (page - 1) * PAGE_SIZE
+    for i, doc in enumerate(docs[first:first + PAGE_SIZE], start + first):
         with st.container(border=True):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
             merke = "  :green[✓ Brukt i svaret]" if doc.get("_brukt") else ""
@@ -1144,6 +1177,18 @@ def render_documents(docs, total, key):
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
+    if pages > 1:
+        cols = st.columns([1.3] + [0.5] * pages + [1.3])
+        if cols[0].button("← Forrige", key=f"{sk}_prev", disabled=page <= 1):
+            st.session_state[sk] = page - 1
+            st.rerun()
+        for p in range(1, pages + 1):
+            if cols[p].button(str(p), key=f"{sk}_{p}", type="primary" if p == page else "secondary"):
+                st.session_state[sk] = p
+                st.rerun()
+        if cols[-1].button("Neste →", key=f"{sk}_next", disabled=page >= pages):
+            st.session_state[sk] = page + 1
+            st.rerun()
 
 
 def render_assistant(message, idx, show_feedback=True, last=False):
@@ -1163,22 +1208,22 @@ def render_assistant(message, idx, show_feedback=True, last=False):
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
         mid = str(message.get("id") or idx)
-        n_show = st.session_state.get(f"nshow_{mid}", SHOW_SOURCES)
-        all_docs, docs = docs, docs[:n_show]
-        tittel = f"📄 Kilder ({len(docs)} av {len(all_docs)})" if len(all_docs) > len(docs) else f"📄 Kilder ({len(docs)})"
-        with st.expander(tittel):
-            if any(d.get("_brukt") for d in docs):
-                st.caption("Kildene merket «✓ Brukt i svaret» står først, med samme nummer som [1], [2] … "
-                           "i teksten. De andre inneholder søkeordene, men svaret bygger ikke på dem, og de kan handle om noe annet.")
-            # Unik noekkel per svar: ellers arver listen sidenummeret («Viser 6–10») fra et tidligere svar.
-            render_documents(docs, len(docs), mid)
-            if len(all_docs) > n_show:
-                if st.button(f"Vis flere treff ({min(10, len(all_docs) - n_show)} til)", key=f"more_{mid}"):
-                    st.session_state[f"nshow_{mid}"] = n_show + 10
-                    st.rerun()
-    if SOK_URL and message.get("query") and (docs or message.get("choices")):
-        st.markdown(f"<small>[🔎 Se alle treff i dokumentsøket →]"
-                    f"({SOK_URL}?sok={quote(message['query'])})</small>", unsafe_allow_html=True)
+        aktuelt, andre = split_sources(docs, message.get("query") or "")
+        with st.expander(f"📄 Kilder ({len(docs)})"):
+            fane1, fane2 = st.tabs([f"Mest aktuelt ({len(aktuelt)})", f"Andre treff ({len(andre)})"])
+            with fane1:
+                if any(d.get("_brukt") for d in aktuelt):
+                    st.caption("Kildene merket «✓ Brukt i svaret» har samme nummer som [1], [2] … i teksten. "
+                               "Deretter følger sider om samme sted eller samme tema.")
+                render_documents(aktuelt, f"{mid}_a", 1)
+                if not aktuelt:
+                    st.caption("Ingen dokumenter her.")
+            with fane2:
+                st.caption("Disse dokumentene inneholder søkeordene, men svaret bygger ikke på dem. "
+                           "De kan handle om andre temaer, for eksempel et ord som bare nevnes i forbifarten.")
+                render_documents(andre, f"{mid}_b", len(aktuelt) + 1)
+                if not andre:
+                    st.caption("Ingen andre treff.")
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
