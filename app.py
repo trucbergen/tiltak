@@ -57,7 +57,7 @@ SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 6
-SHOW_SOURCES = 20  # antall dokumenter som vises under «Kilder» (de mest relevante)
+SHOW_SOURCES = 10  # antall dokumenter som vises under «Kilder» (de mest relevante)
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
 PAGE_SIZE = 5
@@ -690,6 +690,13 @@ def strip_contact(text):
     return re.sub(r"\s{2,}", " ", t).strip()
 
 
+def site_section(url):
+    """Del av nettstedet: de to foerste mappene i URL-en, f.eks. «innbyggerhjelpen/helse-og-omsorg»."""
+    import urllib.parse
+    parts = [p for p in urllib.parse.urlparse(str(url or "")).path.strip("/").split("/") if p]
+    return "/".join(parts[:2]).lower()
+
+
 def renumber_sources(answer, docs, n_ai=AI_SOURCES):
     """Nummerer kildene i den rekkefoelgen svaret bruker dem: [4] [1] [5] -> [1] [2] [3].
     Brukte kilder flyttes foerst og merkes (_brukt). Ingen dokumenter forsvinner."""
@@ -705,7 +712,12 @@ def renumber_sources(answer, docs, n_ai=AI_SOURCES):
                     lambda m: f"[{new_nr[int(m.group(1))]}]" if int(m.group(1)) in new_nr else m.group(0), answer)
     used = [dict(docs[o - 1], _brukt=True) for o in order]
     rest = [d for i, d in enumerate(docs, 1) if i not in new_nr]
-    return answer, used + rest
+    # Resten sorteres etter de brukte kildene: samme del av nettstedet (f.eks. helse-og-omsorg)
+    # foerst, andre treff nederst med skillelinje. Virker for alle kommuner (bruker URL-mappen).
+    used_sections = {site_section(d.get("url")) for d in used}
+    same = [d for d in rest if site_section(d.get("url")) in used_sections]
+    other = [dict(d, _andre=True) for d in rest if site_section(d.get("url")) not in used_sections]
+    return answer, used + same + other
 
 
 def context(docs):
@@ -1086,6 +1098,13 @@ def render_documents(docs, total, key):
     first = (page - 1) * PAGE_SIZE
     last = min(first + PAGE_SIZE, len(docs))
     for i, doc in enumerate(docs[first:last], first + 1):
+        # Skillelinje foran de svakere treffene (bare naar det finnes bedre treff foran)
+        if doc.get("_andre") and i > 1 and not docs[i - 2].get("_andre"):
+            st.markdown("<div style='display:flex;align-items:center;gap:10px;color:#7a8595;"
+                        "font-size:0.85rem;margin:14px 0 2px'><hr style='flex:1;margin:0'>"
+                        "Flere dokumenter med samme ord<hr style='flex:1;margin:0'></div>",
+                        unsafe_allow_html=True)
+            st.caption("Funnet fordi de inneholder søkeordene. Kan handle om noe annet.")
         with st.container(border=True):
             title = html.escape(str(doc.get("tittel") or "Uten tittel"))
             merke = "  :green[✓ Brukt i svaret]" if doc.get("_brukt") else ""
