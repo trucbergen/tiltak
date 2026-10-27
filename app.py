@@ -86,7 +86,8 @@ def secret(name):
 @st.cache_resource(show_spinner=False)
 def groq_client(key):
     from groq import Groq
-    return Groq(api_key=key, timeout=40.0, max_retries=0)
+    # max_retries: SDK-en venter og proever igjen ved 429 (for mange forespoersler) og 5xx.
+    return Groq(api_key=key, timeout=60.0, max_retries=3)
 
 
 def error_status(exc):
@@ -301,7 +302,8 @@ def search_documents(question):
         queries.append(("MINST_2", pair_query))
         # Siste trinn: minst ETT av ordene (f.eks. «fritidsklubb Loddefjord» der ingen side
         # har begge ordene). BM25 rangerer sider med flest og sjeldnest ord oeverst.
-        queries.append(("MINST_1", " OR ".join(map(quote_word, core[:5]))))
+        if len(core) <= 3:
+            queries.append(("MINST_1", " OR ".join(map(quote_word, core[:5]))))
     elif len(core) == 1:
         queries.append(("ETT_FAGORD", quote_word(core[0])))
 
@@ -864,6 +866,8 @@ def normalize_markdown(text):
     - Overskrifter blir fet tekst, slik at begge modeller ser like ut.
     """
     text = re.sub(r"<br\s*/?>", "\n", text)
+    # gpt-oss skriver noen ganger kilder som 【1†L1-L4】 eller 【1】: gjoer om til [1]
+    text = re.sub(r"\s*【\s*(\d+)[^】]*】", r" [\1]", text)
     text = tables_to_bullets(text)
     out = []
     for line in text.splitlines():
