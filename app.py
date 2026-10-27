@@ -57,7 +57,15 @@ SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 6
-SHOW_SOURCES = 10  # antall dokumenter som vises under «Kilder» (de mest relevante)
+SHOW_SOURCES = 10  # antall dokumenter som vises under «Kilder» foerst
+SOURCES_MAX = 50   # «Vis flere treff» kan vise inntil saa mange (10 om gangen)
+# Lenke til dokumentsoeket (Shiny). Settes i Secrets som SOK_URL = "https://..."; tom = ingen lenke.
+SOK_URL = os.environ.get("SOK_URL", "").strip()
+# Vage spoersmaal: mange treff spredt over mange deler av nettstedet -> be brukeren avgrense
+VAGUE_MIN_HITS = 100       # minst saa mange noekkelordtreff
+VAGUE_MAX_WORDS = 3        # og hoeyst saa mange innholdsord i spoersmaalet
+VAGUE_MIN_SECTIONS = 5     # treffene fordeler seg paa minst saa mange omraader ...
+VAGUE_MAX_SHARE = 0.35     # ... og ingen omraade har mer enn denne andelen
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 250
 PAGE_SIZE = 5
@@ -690,6 +698,32 @@ def strip_contact(text):
     return re.sub(r"\s{2,}", " ", t).strip()
 
 
+GENERIC_SECTIONS = {"tema", "aktuelt", "nyheter", "artikler", "avdelinger", "om", "info", "side"}
+
+
+def section_label(url):
+    """Lesbart navn paa omraadet en side ligger i, fra URL-en (f.eks. «Helse og omsorg»)."""
+    import urllib.parse
+    parts = [urllib.parse.unquote(p) for p in urllib.parse.urlparse(str(url or "")).path.strip("/").split("/") if p]
+    for p in parts[1:3] or parts[:1]:          # hopp over generelle mapper som «tema»
+        if p.lower() not in GENERIC_SECTIONS:
+            p = p.replace("-", " ").strip()
+            return p[:1].upper() + p[1:]
+    return ""
+
+
+def vague_topics(question, docs, total):
+    """Returnerer omraader aa velge mellom hvis spoersmaalet er for vagt, ellers []."""
+    from collections import Counter
+    if total < VAGUE_MIN_HITS or len(words_from_question(question)) > VAGUE_MAX_WORDS:
+        return []
+    labels = [section_label(d.get("url")) for d in docs[:SOURCES_MAX]]
+    count = Counter(x for x in labels if x)
+    if len(count) < VAGUE_MIN_SECTIONS or max(count.values()) / max(1, len(labels)) > VAGUE_MAX_SHARE:
+        return []
+    return [lab for lab, _ in count.most_common(6)]
+
+
 def site_section(url):
     """Del av nettstedet: de to foerste mappene i URL-en, f.eks. «innbyggerhjelpen/helse-og-omsorg»."""
     import urllib.parse
@@ -1091,13 +1125,7 @@ def clean_summary(text):
 def render_documents(docs, total, key):
     if not docs:
         return
-    pages = max(1, (len(docs) + PAGE_SIZE - 1) // PAGE_SIZE)
-    state_key = f"page_{key}"
-    page = min(max(st.session_state.get(state_key, 1), 1), pages)
-    st.session_state[state_key] = page
-    first = (page - 1) * PAGE_SIZE
-    last = min(first + PAGE_SIZE, len(docs))
-    for i, doc in enumerate(docs[first:last], first + 1):
+    for i, doc in enumerate(docs, 1):
         # Skillelinje foran de svakere treffene (bare naar det finnes bedre treff foran)
         if doc.get("_andre") and i > 1 and not docs[i - 2].get("_andre"):
             st.markdown("<div style='display:flex;align-items:center;gap:10px;color:#7a8595;"
@@ -1116,35 +1144,41 @@ def render_documents(docs, total, key):
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
-    if pages > 1:
-        left, mid, right = st.columns([1, 2, 1])
-        with left:
-            if st.button("← Forrige", disabled=page <= 1, key=f"prev_{key}"):
-                st.session_state[state_key] = page - 1
-                st.rerun()
-        with mid:
-            st.markdown(f"<p style='text-align:center'>Viser {first + 1}–{last} av {total}</p>",
-                        unsafe_allow_html=True)
-        with right:
-            if st.button("Neste →", disabled=page >= pages, key=f"next_{key}"):
-                st.session_state[state_key] = page + 1
-                st.rerun()
 
 
-def render_assistant(message, idx, show_feedback=True):
+def render_assistant(message, idx, show_feedback=True, last=False):
     if message.get("note"):
         st.caption("✏️ " + message["note"])
     st.markdown(message.get("content") or "Ingen svar.")
+    # Vagt spoersmaal: knapper for aa avgrense (som «Avgrens søket» paa kommunens nettside)
+    if message.get("choices") and last:
+        cols = st.columns(min(3, len(message["choices"])))
+        for n, label in enumerate(message["choices"]):
+            with cols[n % len(cols)]:
+                if st.button(label, key=f"ch_{message.get('id')}_{n}", use_container_width=True):
+                    st.session_state["pending_q"] = f"{message.get('query', '')} {label.lower()}".strip()
+                    st.rerun()
     docs = message.get("sources") or []
     if docs:
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
-        with st.expander(f"📄 Kilder ({len(docs)})"):
+        mid = str(message.get("id") or idx)
+        n_show = st.session_state.get(f"nshow_{mid}", SHOW_SOURCES)
+        all_docs, docs = docs, docs[:n_show]
+        tittel = f"📄 Kilder ({len(docs)} av {len(all_docs)})" if len(all_docs) > len(docs) else f"📄 Kilder ({len(docs)})"
+        with st.expander(tittel):
             if any(d.get("_brukt") for d in docs):
                 st.caption("Kildene merket «✓ Brukt i svaret» står først, med samme nummer som [1], [2] … "
                            "i teksten. De andre inneholder søkeordene, men svaret bygger ikke på dem, og de kan handle om noe annet.")
             # Unik noekkel per svar: ellers arver listen sidenummeret («Viser 6–10») fra et tidligere svar.
-            render_documents(docs, len(docs), str(message.get("id") or idx))
+            render_documents(docs, len(docs), mid)
+            if len(all_docs) > n_show:
+                if st.button(f"Vis flere treff ({min(10, len(all_docs) - n_show)} til)", key=f"more_{mid}"):
+                    st.session_state[f"nshow_{mid}"] = n_show + 10
+                    st.rerun()
+    if SOK_URL and message.get("query") and (docs or message.get("choices")):
+        st.markdown(f"<small>[🔎 Se alle treff i dokumentsøket →]"
+                    f"({SOK_URL}?sok={quote(message['query'])})</small>", unsafe_allow_html=True)
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1198,9 +1232,10 @@ for i, message in enumerate(st.session_state.messages):
         if message["role"] == "user":
             st.markdown(message["content"])
         else:
-            render_assistant(message, i)
+            render_assistant(message, i, last=(i == len(st.session_state.messages) - 1))
 
-question = st.chat_input("Still et spørsmål om kommunale dokumenter ...") or example_clicked
+question = (st.chat_input("Still et spørsmål om kommunale dokumenter ...") or example_clicked
+            or st.session_state.pop("pending_q", None))
 if question and question.strip():
     question = question.strip()[:1200]
     asked = question                                   # det brukeren skrev (vises i chatten)
@@ -1220,7 +1255,12 @@ if question and question.strip():
         t0 = time.perf_counter()
         status = "ok"
         hide_sources = False   # True naar modellen svarer at ingen kilder er relevante
-        if not docs:
+        choices = vague_topics(question, docs, total) if docs else []
+        if choices:
+            status = "avklaring"
+            answer = ("Spørsmålet ditt gir mange treff innen ulike områder. "
+                      "Hva gjelder det? Velg et område under, eller skriv et mer konkret spørsmål.")
+        elif not docs:
             status = "ingen_treff"
             answer = ("Jeg fant ingen dokumenter som passer til spørsmålet. "
                       "Det betyr ikke at tilbudet ikke finnes. Prøv gjerne andre ord.")
@@ -1246,14 +1286,15 @@ if question and question.strip():
                     else:
                         answer = ("Det oppstod en feil da svaret skulle lages. "
                                   "Dokumentene som ble funnet, ligger under Kilder.")
-        if docs and not hide_sources:
+        if docs and not hide_sources and not choices:
             answer, docs = renumber_sources(answer, docs)
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
         note = ("Søkte på " + ", ".join(f"«{r}»" for _, r in spell_fixes)
                 + " (rettet fra " + ", ".join(f"«{w}»" for w, _ in spell_fixes) + ")") if spell_fixes else ""
         message = {"role": "assistant", "content": answer, "note": note,
-                   "sources": [] if hide_sources else docs[:SHOW_SOURCES], "total": total,
+                   "sources": [] if hide_sources else docs[:SOURCES_MAX], "total": total,
+                   "choices": choices, "query": asked,
                    "id": answer_id}
         top = docs[:AI_SOURCES]
         log_event("svar", [
