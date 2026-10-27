@@ -49,6 +49,10 @@ SEM_MIN_SIMILARITY = 0.50   # absolutt gulv (sikkerhetsnett)
 SEM_RELATIVE_MARGIN = 0.03  # hoyere = flere treff, lavere = faerre
 SEM_MAX_DOCS = 15           # maks antall semantiske dokumenttreff
 RRF_K = 60             # standardverdi for Reciprocal Rank Fusion
+# Semantisk soek er svakt for korte soek og kan trekke inn urelaterte sider.
+SEM_WEIGHT = 0.5            # semantisk liste teller halvt i RRF
+SHORT_QUERY_WORDS = 2       # spoersmaal med saa faa innholdsord regnes som korte
+SHORT_QUERY_MIN_FTS = 10    # kort spoersmaal + minst saa mange noekkelordtreff -> ikke semantisk
 SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
@@ -498,16 +502,17 @@ def fetch_documents(doc_ids):
     return [by_id[d] for d in doc_ids if d in by_id]
 
 
-def rrf_merge(*rankings, k=RRF_K):
+def rrf_merge(*rankings, k=RRF_K, weights=None):
     """Reciprocal Rank Fusion: summen av 1/(k + rang) over alle lister.
 
     Ved lik score vinner dokumentet med best rang i den FORSTE listen
     (noekkelord), slik at eksakte treff gaar foran rene meningstreff.
     """
     scores, first_rank = {}, {}
+    weights = weights or [1.0] * len(rankings)
     for li, ranking in enumerate(rankings):
         for rank, doc_id in enumerate(ranking, 1):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+            scores[doc_id] = scores.get(doc_id, 0.0) + weights[li] / (k + rank)
             if li == 0:
                 first_rank.setdefault(doc_id, rank)
     return sorted(scores, key=lambda d: (-round(scores[d], 12), first_rank.get(d, 10**9), d))
@@ -535,7 +540,9 @@ def run_search(question, method):
         return docs, len(docs), f"Semantisk (likhet ≥ {floor:.2f})", None
     fts_docs, fts_total, fts_mode = search_documents(question)
     fts_ids = [d["doc_id"] for d in fts_docs]
-    merged = rrf_merge(fts_ids, sem_ids)[:MAX_LIST_RESULTS]
+    if len(words_from_question(question)) <= SHORT_QUERY_WORDS and fts_total >= SHORT_QUERY_MIN_FTS:
+        sem_ids, sem_score = [], {}
+    merged = rrf_merge(fts_ids, sem_ids, weights=[1.0, SEM_WEIGHT])[:MAX_LIST_RESULTS]
     known = {d["doc_id"]: d for d in fts_docs}
     missing = [d for d in merged if d not in known]
     known.update({d["doc_id"]: d for d in fetch_documents(missing)})
