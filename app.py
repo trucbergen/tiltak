@@ -1277,6 +1277,11 @@ def nullstill_filtre():
 
 with st.sidebar:
     st.title("🔎 Finn kommunale tilbud")
+    # Hold ny samtale synlig over filtrene og det store sporsmalsfeltet.
+    if st.button("＋ Ny samtale", use_container_width=True, type="primary"):
+        st.session_state.messages = []
+        st.session_state.pop("refresh_last", None)
+        st.rerun()
     st.caption("Velg filtre én gang. De gjelder også neste spørsmål.")
     st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
     st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
@@ -1287,10 +1292,6 @@ with st.sidebar:
     with st.form("sporsmal_form", clear_on_submit=True):
         skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=220)
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="primary")
-    if st.button("Ny samtale", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.pop("refresh_last", None)
-        st.rerun()
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
 
 valgte = aktive_filtre()
