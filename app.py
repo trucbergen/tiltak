@@ -1328,7 +1328,7 @@ def render_assistant(message, idx, show_feedback=True, last=False):
     if message.get("count_context") is not None:
         shown = len(message.get("display_docs") or [])
         total = message.get("all_total", message.get("actual_total", 0))
-        st.markdown(f"**{shown} treff i resultatlisten · {total:,} treff i søket totalt**".replace(",", " "))
+        st.markdown(f"**{shown} dokumenter passer filtrene · {total:,} treff i søket totalt**".replace(",", " "))
         with st.expander("Hva betyr treffantallene?"):
             st.write("Treffene er dokumenter fra kommunen, ikke antall ulike tilbud. "
                      "Resultatlisten viser dokumenter som passer filtrene dine, "
@@ -1410,12 +1410,23 @@ def aktive_filtre():
 
 
 def oppdater_siste_svar():
-    # Behold det siste spørsmålet klart for nytt søk med nye filtre.
-    if st.session_state.get("messages"):
-        for m in reversed(st.session_state.messages):
-            if m.get("role") == "user":
-                st.session_state["sporsmal_input"] = m.get("content", "")
-                break
+    """Kjor det siste sporsmalet automatisk med nye filtre.
+
+    Callbacken kjoeres foer widgetene tegnes, slik at et tidligere AI-svar
+    aldri fremstilles som et svar med nye filtre.
+    """
+    messages = st.session_state.get("messages", [])
+    last_question = next((m.get("content", "") for m in reversed(messages)
+                          if m.get("role") == "user"), "")
+    if last_question.strip():
+        st.session_state["pending_q"] = last_question
+        st.session_state["sporsmal_input"] = last_question
+        # Fjern det gamle sporsmalet/svaret fra den synlige samtalen.
+        # Et nytt par legges til av den vanlige soekeflyten nedenfor.
+        if messages and messages[-1].get("role") == "assistant":
+            messages.pop()
+        if messages and messages[-1].get("role") == "user":
+            messages.pop()
 
 
 def nullstill_filtre():
@@ -1433,6 +1444,7 @@ def ny_samtale():
     nullstill_filtre()
     st.session_state.pop("refresh_last", None)
     st.session_state["sporsmal_input"] = ""
+    st.session_state.pop("pending_q", None)
 
 
 with st.sidebar:
@@ -1479,6 +1491,7 @@ for i, message in enumerate(st.session_state.messages):
 
 question = (skrevet if sendt else None) or example_clicked or st.session_state.pop("pending_q", None)
 if question and question.strip():
+    st.session_state.pop("pending_q", None)
     question = question.strip()[:1200]
     asked = question                                   # det brukeren skrev (vises i chatten)
     question, spell_fixes = correct_spelling(question)  # brukes til soek og svar
