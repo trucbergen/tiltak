@@ -65,7 +65,7 @@ VAGUE_MAX_WORDS = 3        # og hoeyst saa mange innholdsord i spoersmaalet
 VAGUE_MIN_SECTIONS = 5     # treffene fordeler seg paa minst saa mange omraader ...
 VAGUE_MAX_SHARE = 0.35     # ... og ingen omraade har mer enn denne andelen
 MAX_CANDIDATES = 15
-MAX_LIST_RESULTS = 250
+MAX_LIST_RESULTS = 300
 PAGE_SIZE = 10  # dokumenter per side i kildelisten
 MAX_CONTEXT_CHARS = 1900
 # gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
@@ -272,7 +272,7 @@ def search_documents(question):
 
     all_words = words_from_question(question)
     if not all_words:
-        return [], 0, "INGEN"
+        return [], 0, "INGEN", None
 
     # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
     generic = {
@@ -362,8 +362,8 @@ def search_documents(question):
             rows = con.execute(
                 sql, (expr, *bonus_params, MAX_LIST_RESULTS)
             ).fetchall()
-            return [dict(row) for row in rows], total, mode
-    return [], 0, "INGEN"
+            return [dict(row) for row in rows], total, mode, expr
+    return [], 0, "INGEN", None
 
     # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
     generic = {
@@ -427,8 +427,8 @@ def search_documents(question):
             rows = con.execute(
                 sql, (expr, *bonus_params, MAX_LIST_RESULTS)
             ).fetchall()
-            return [dict(row) for row in rows], total, mode
-    return [], 0, "INGEN"
+            return [dict(row) for row in rows], total, mode, expr
+    return [], 0, "INGEN", None
 
 
 # ---------------------------------------------------------------------------
@@ -677,15 +677,15 @@ def filter_and_sort_documents(docs, malgruppe="Alle", omrade="Hele Bergen",
 def run_search(question, method):
     """Returner (dokumenter, antall, modus-tekst, merknad) for valgt sokemetode."""
     if method == "Nøkkelord" or not vectors_available():
-        docs, total, mode = search_documents(question)
+        docs, total, mode, expr = search_documents(question)
         note = None if method == "Nøkkelord" else "Vektorfil mangler; bruker nøkkelordsøk."
-        return docs, total, f"Nøkkelord · {mode}", note
+        return docs, total, f"Nøkkelord · {mode}", note, {"fts_expr": expr, "semantic_ids": []}
     try:
         sem = semantic_doc_ranking(question)
     except Exception as exc:  # modell/vektorfeil: fall tilbake, men si fra
-        docs, total, mode = search_documents(question)
+        docs, total, mode, expr = search_documents(question)
         return docs, total, f"Nøkkelord · {mode}", (
-            f"Semantisk søk feilet ({type(exc).__name__}: {str(exc)[:250]}); bruker nøkkelordsøk.")
+            f"Semantisk søk feilet ({type(exc).__name__}: {str(exc)[:250]}); bruker nøkkelordsøk."), {"fts_expr": expr, "semantic_ids": []}
     sem_ids = [d for d, _ in sem]
     sem_score = dict(sem)
     if method == "Semantisk":
@@ -693,8 +693,8 @@ def run_search(question, method):
         for d in docs:
             d["sem_score"] = sem_score.get(d["doc_id"])
         floor = min((d["sem_score"] for d in docs if d.get("sem_score") is not None), default=0)
-        return docs, len(docs), f"Semantisk (likhet ≥ {floor:.2f})", None
-    fts_docs, fts_total, fts_mode = search_documents(question)
+        return docs, len(docs), f"Semantisk (likhet ≥ {floor:.2f})", None, {"fts_expr": None, "semantic_ids": sem_ids}
+    fts_docs, fts_total, fts_mode, fts_expr = search_documents(question)
     fts_ids = [d["doc_id"] for d in fts_docs]
     # Kort spoersmaal: semantisk soek brukes ikke naar noekkelord gir mange treff, og heller ikke
     # naar de gir 0 (da gir semantisk soek tilfeldige sider som «luftkvalitet» for et feilstavet ord).
@@ -712,7 +712,36 @@ def run_search(question, method):
                           else "nøkkelord" if d["doc_id"] in fts_set else "semantisk")
     floor = min(sem_score.values(), default=0)
     return docs, len(docs), (f"Hybrid · {fts_mode} ({fts_total} FTS-treff) + semantisk "
-                             f"({len(sem_ids)} med likhet ≥ {floor:.2f})"), None
+                             f"({len(sem_ids)} med likhet ≥ {floor:.2f})"), None, {"fts_expr": fts_expr, "semantic_ids": sem_ids}
+
+
+def count_full_search_matches(count_context, informasjonstype="Alle"):
+    """Eksakt antall unike dokumenter i hele DB for samme FTS-uttrykk
+    pluss semantiske dokument-ID-er som er valgt av sokemotoren.
+    Andre filtre (malgruppe/bydel) er kun prioritering og teller ikke som avgrensning.
+    """
+    ctx = count_context or {}
+    expr = ctx.get("fts_expr")
+    sem_ids = list(dict.fromkeys(ctx.get("semantic_ids") or []))
+    if not expr and not sem_ids:
+        return 0
+    params = []
+    selects = []
+    if expr:
+        selects.append("SELECT d.doc_id FROM documents_fts_full f "
+                       "JOIN documents d ON d.rowid=f.rowid "
+                       "WHERE documents_fts_full MATCH ?")
+        params.append(expr)
+    if sem_ids:
+        selects.append("SELECT doc_id FROM documents WHERE doc_id IN (" + ",".join("?" for _ in sem_ids) + ")")
+        params.extend(sem_ids)
+    union = " UNION ".join(selects)
+    sql = f"SELECT COUNT(*) FROM ({union}) matches JOIN documents d ON d.doc_id=matches.doc_id"
+    if informasjonstype != "Alle":
+        sql += " WHERE lower(trim(coalesce(d.informasjonstype,''))) = lower(trim(?))"
+        params.append(informasjonstype)
+    with connect() as con:
+        return int(con.execute(sql, params).fetchone()[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1284,6 +1313,19 @@ def render_documents(docs, key, start=1):
 def render_assistant(message, idx, show_feedback=True, last=False):
     if message.get("note"):
         st.caption("✏️ " + message["note"])
+    # Antallet telles i hele databasen, ikke bare blant de 300 kandidatene.
+    if message.get("count_context") is not None:
+        current = message.get("actual_total", 0)
+        overall = message.get("all_total", current)
+        st.markdown(f"**{current:,} dokumenttreff**".replace(",", " "))
+        if current != overall:
+            st.caption(f"{overall:,} treff totalt før informasjonstypefilter · ".replace(",", " ") +
+                       f"Inntil {MAX_LIST_RESULTS} kandidater hentes til visning.")
+        else:
+            st.caption(f"Treff i hele databasen · Inntil {MAX_LIST_RESULTS} kandidater hentes til visning.")
+        st.caption("Tallet gjelder unike dokumenter, ikke antall kommunale tilbud. "
+                   "Område og målgruppe prioriterer treff, men begrenser ikke antallet. "
+                   "Hybridsøk teller FTS-treff og de semantiske kandidatene som søkemotoren valgte.")
     st.markdown(message.get("content") or "Ingen svar.")
     # Vagt spoersmaal: knapper for aa avgrense (som «Avgrens søket» paa kommunens nettside)
     if message.get("choices") and last:
@@ -1325,7 +1367,7 @@ def render_assistant(message, idx, show_feedback=True, last=False):
     if "filtered_docs" in message:
         filtered = message["filtered_docs"]
         st.info("Filtrene endrer bare dokumenttreffene nedenfor. AI-svaret over er fra det opprinnelige spørsmålet og er ikke generert på nytt.")
-        st.caption(f"Dokumenttreff med aktive filtre: {message.get('filtered_total', len(filtered))}")
+        st.caption(f"Viser {len(filtered)} av {message.get('actual_total', 0):,} dokumenttreff i hele databasen (innenfor lagret kandidat-utvalg).".replace(",", " "))
         with st.expander(f"🔎 Filtrerte dokumenttreff ({len(filtered)} vist)", expanded=True):
             if filtered:
                 # Bruk separat kildevisning, uten å endre siteringsnumrene i AI-svaret.
@@ -1423,6 +1465,7 @@ if st.session_state.pop("refresh_last", False) and st.session_state.messages:
         # De vises separat, slik at [1], [2] osv. fortsatt er korrekte.
         last["filtered_docs"] = docs[:SOURCES_MAX]
         last["filtered_total"] = len(docs)
+        last["actual_total"] = count_full_search_matches(last.get("count_context"), valgt_type)
         last["filters"] = dict(valgte)
 
 example_clicked = None
@@ -1452,11 +1495,13 @@ if question and question.strip():
     with st.chat_message("assistant"):
         try:
             with st.spinner("Søker i dokumentene ..."):
-                docs, total, _mode, _note = run_search(question, SEARCH_METHOD)
+                docs, total, _mode, _note, count_context = run_search(question, SEARCH_METHOD)
+                actual_total = count_full_search_matches(count_context, valgt_type)
+                all_total = count_full_search_matches(count_context)
                 raw_docs = [dict(d) for d in docs]
                 docs = filter_and_sort_documents(
                     docs, valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
-                total = len(docs) if valgt_type != "Alle" else total
+                total = actual_total
                 if valgt_sortering == "Mest relevant":
                     docs = diversify(docs)
         except sqlite3.Error:
@@ -1512,7 +1557,9 @@ if question and question.strip():
                    "choices": choices, "query": asked,
                    "filters": {"målgruppe": valgt_malgruppe, "område": valgt_omrade,
                                "informasjonstype": valgt_type, "sortering": valgt_sortering},
-                   "id": answer_id, "raw_docs": raw_docs, "query_corrected": question}
+                   "id": answer_id, "raw_docs": raw_docs, "query_corrected": question,
+                   "count_context": count_context, "actual_total": actual_total,
+                   "all_total": all_total}
         top = docs[:AI_SOURCES]
         log_event("svar", [
             now_str(), answer_id, tester_id(), st.session_state.session_id, question, answer,
