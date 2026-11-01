@@ -735,26 +735,37 @@ def url_group(url):
     return "/".join(parts[:-1]) or "/"
 
 
+ACTIVITY_SECTIONS = ("kultur-idrett-og-fritid", "kultur-og-fritid", "idrett", "fritid")
+ACTIVITY_TERMS = r"aktivitet|fritid|idrett|klubb|kultur|fysak|aktivitetskort|trening|svømm|turn|musikk|ungdomshus"
+HELP_SECTIONS = ("helse-og-omsorg", "barnevern", "avlastning", "sosiale-tjenester")
+WHOLE_CITY_MIN = 5   # dokument med >= 5 navngitte bydeler regnes som bydelsdekkende
+
+
 def rank_for_question(docs, question):
     """Ranger kilder etter brukerens behov uten aa fjerne dokumenter.
 
-    Konkrete tjenestesider prioriteres ved tilbudsspoersmaal. Sted og
-    maalgruppe leses fra spoersmaalet, ikke fra ekstra brukerfiltre.
+    Rekkefoelge av signaler: (1) hva brukeren spoer etter (aktivitet vs. hjelp),
+    (2) riktig maalgruppe, (3) geografi: kun-i-bydelen > dekker flere bydeler > hele Bergen.
+    Nesten alle sider er «tjeneste» under innbyggerhjelpen, saa nettstedsomraadet
+    (Kultur idrett og fritid / Helse og omsorg) er det som faktisk skiller dem.
     """
     q = question.casefold()
     places = {p for p in PLACE_NAMES if re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)", q)}
-    activity = bool(re.search(r"aktivitet|fritid|fritidsklubb|idrett|kulturtilbud|arrangement", q))
+    activity = bool(re.search(r"aktivitet|fritid|fritidsklubb|idrett|kulturtilbud|arrangement|trening|hobby", q))
     wants_offers = bool(re.search(r"hvilke|hvor|finnes|tilbud|tjenest|hjelp|aktivitet|kan jeg", q))
     research = bool(re.search(r"rapport|forskning|statistikk|undersøk|budsjett|vedtak|politikk|planer", q))
-    groups = []
+    youth = ("barn", "unge", "ungdom", "tenår", "elev")
+    elderly = ("eldre", "senior", "pensjonist", "demens")
+    groups, wrong = [], ()
     if re.search(r"barn|ungdom|unge|tenår|elev", q):
-        groups = ["barn", "unge", "ungdom", "tenår", "elev"]
+        groups, wrong = list(youth), elderly + ("pårørende",)
     elif re.search(r"eldre|senior|pensjonist", q):
-        groups = ["eldre", "senior", "pensjonist"]
+        groups, wrong = list(elderly), youth
 
     def score(doc):
         title = str(doc.get("tittel") or "").casefold()
         summary = str(doc.get("oppsummering") or "").casefold()
+        tema = str(doc.get("tema") or "").casefold()
         target = str(doc.get("malgruppe") or "").casefold()
         typ = str(doc.get("informasjonstype") or "").casefold()
         district = str(doc.get("bydeler") or "").casefold()
@@ -762,37 +773,53 @@ def rank_for_question(docs, question):
         scope = str(doc.get("bydel_omfang") or "").casefold()
         url = str(doc.get("url") or "").casefold()
         pts = 0
+
+        # (2) Maalgruppe
         if groups:
             if any(g in target for g in groups):
                 pts += 12
             elif any(g in title for g in groups):
                 pts += 6
-            elif target and any(g in target for g in ("senior", "eldre")) and groups[0] == "barn":
-                pts -= 14
+            elif target and any(w in target for w in wrong):
+                pts -= 25   # f.eks. demens/eldre naar brukeren spoer om barn
+
+        # (3) Geografi: et dokument som lister alle bydeler er i praksis «hele Bergen».
         if places:
-            if any(re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)",
-                             " ".join((district, geo, title, url))) for p in places):
+            n_districts = len([x for x in re.split(r"[;,|]", district) if x.strip()])
+            named = lambda text: any(re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)", text) for p in places)
+            if named(" ".join((title, url))):
                 pts += 17
+            elif named(" ".join((district, geo))):
+                pts += 17 if n_districts < WHOLE_CITY_MIN else 6
             elif any(x in scope for x in ("hele kommunen", "hele bergen", "alle bydeler")):
                 pts += 4
-            elif district and not any(p in district for p in places):
-                pts -= 5  # Andre navngitte bydeler er mindre relevante
+            elif district:
+                pts -= 5  # bare andre navngitte bydeler
+
         if wants_offers and not research:
             if "/innbyggerhjelpen/" in url or page_type(url) == "Tjenester":
-                pts += 16
+                pts += 6 if activity else 16
             if any(x in typ for x in ("tjeneste", "aktivitet", "tilbud")):
-                pts += 8
+                pts += 4 if activity else 8
             if any(x in typ for x in ("rapport", "fagartikkel", "nyhet")):
                 pts -= 14
             if page_type(url) in ("Politikk", "Nyheter og aktuelt"):
                 pts -= 12
             if re.search(r"rapport|kartlegg|undersøk|budsjett|forskning|statistikk|strategi", title):
                 pts -= 13
+            # (1) Hva brukeren spoer etter: aktivitet teller mest.
             if activity:
-                if re.search(r"fritidsaktivitet|aktivitetstilbud|fritidsklubb|idrettslag|kulturtilbud", title):
-                    pts += 10
-                if re.search(r"fritidsaktivitet|aktivitetstilbud|fritidsklubb", summary):
+                in_activity_area = any(s in url for s in ACTIVITY_SECTIONS) or \
+                    re.search(r"fritid|idrett|kultur", tema)
+                title_activity = re.search(ACTIVITY_TERMS, title)
+                if in_activity_area:
+                    pts += 20
+                if title_activity:
+                    pts += 8
+                elif re.search(ACTIVITY_TERMS, summary):
                     pts += 3
+                if any(s in url for s in HELP_SECTIONS) and not title_activity:
+                    pts -= 12   # hjelpetjenester (familiehjelp, stoettekontakt) er ikke fritidstilbud
         return pts
 
     # Stabil sortering: opprinnelig hybridrangering avgjoer ved lik score.
