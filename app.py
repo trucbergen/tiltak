@@ -66,7 +66,7 @@ VAGUE_MIN_SECTIONS = 5     # treffene fordeler seg paa minst saa mange omraader 
 VAGUE_MAX_SHARE = 0.35     # ... og ingen omraade har mer enn denne andelen
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 300
-PAGE_SIZE = 30  # dokumenter per side i kildelisten
+PAGE_SIZE = 10  # dokumenter per side i kildelisten
 MAX_CONTEXT_CHARS = 1900
 # gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
 GROQ_MAX_OUTPUT_TOKENS = 4000
@@ -607,11 +607,7 @@ def information_types():
 
 def filter_and_sort_documents(docs, malgruppe="Alle", omrade="Hele Bergen",
                               informasjonstype="Alle", sortering="Mest relevant"):
-    """Bruk metadata etter hybrid sok. Omrade/malgruppe gir prioritet, ikke tap av treff.
-
-    Informasjonstype er et eksakt filter. Omrade kan ikke behandles som eksakt
-    uten risiko for aa miste kommuneomfattende tilbud eller feilmerkede dokumenter.
-    """
+    """Filtrer lagrede kandidater uten API-kall. Behold kommuneomfattende tilbud."""
     def normal(t):
         return str(t or "").casefold()
 
@@ -639,6 +635,25 @@ def filter_and_sort_documents(docs, malgruppe="Alle", omrade="Hele Bergen",
 
     selected = [d for d in docs if informasjonstype == "Alle" or
                 normal(d.get("informasjonstype")) == normal(informasjonstype)]
+    if omrade != "Hele Bergen":
+        sted = normal(omrade)
+        def relevant_omrade(d):
+            bydeler = normal(d.get("bydeler"))
+            geo = normal(d.get("geografi"))
+            scope = normal(d.get("bydel_omfang"))
+            title = normal(d.get("tittel"))
+            # Eksplisitt bydel eller kommuneomfattende tilbud; ukjent geografisk
+            # dekning inkluderes ikke automatisk som lokalt tilbud.
+            return (sted in [x.strip() for x in re.split(r"[;,|]", bydeler)]
+                    or sted in geo or sted in title
+                    or scope in ("hele kommunen", "hele bergen", "alle bydeler"))
+        selected = [d for d in selected if relevant_omrade(d)]
+    if malgruppe != "Alle":
+        ordliste = MALGRUPPE_ORD[malgruppe]
+        selected = [d for d in selected if
+                    any(w in normal(d.get("malgruppe")) or w in normal(d.get("tittel"))
+                        for w in ordliste)
+                    or normal(d.get("malgruppe")) in ("", "alle", "alle aldersgrupper")]
     # Stabil sortering: behold den opprinnelige FTS/vektor-rangeringen ved lik score.
     selected.sort(key=score, reverse=True)
     if sortering == "Nyeste først":
@@ -1273,12 +1288,14 @@ def render_documents(docs, key, start=1):
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
     if pages > 1:
-        cols = st.columns([1.3] + [0.5] * pages + [1.3])
+        visible_pages = sorted(set([1, pages] + list(range(max(1, page - 2), min(pages, page + 2) + 1))))
+        st.caption(f"Viser {first + 1}–{min(first + PAGE_SIZE, len(docs))} av {len(docs)} · Side {page} av {pages}")
+        cols = st.columns([1.5] + [0.7] * len(visible_pages) + [1.5])
         if cols[0].button("← Forrige", key=f"{sk}_prev", disabled=page <= 1):
             st.session_state[sk] = page - 1
             st.rerun()
-        for p in range(1, pages + 1):
-            if cols[p].button(str(p), key=f"{sk}_{p}", type="primary" if p == page else "secondary"):
+        for ci, p in enumerate(visible_pages, 1):
+            if cols[ci].button(str(p), key=f"{sk}_{p}", type="primary" if p == page else "secondary"):
                 st.session_state[sk] = p
                 st.rerun()
         if cols[-1].button("Neste →", key=f"{sk}_next", disabled=page >= pages):
@@ -1293,7 +1310,15 @@ def render_assistant(message, idx, show_feedback=True, last=False):
     if message.get("count_context") is not None:
         current = message.get("actual_total", 0)
         overall = message.get("all_total", current)
-        st.markdown(f"**{current:,} dokumenttreff**".replace(",", " "))
+        f = message.get("filters") or {}
+        local_filter = f.get("område", "Hele Bergen") != "Hele Bergen" or f.get("målgruppe", "Alle") != "Alle"
+        if local_filter:
+            n = len(message.get("filtered_docs", message.get("raw_docs") or []))
+            st.markdown(f"**{n} filtrerte dokumenter blant de hentede kandidatene**")
+            st.caption(f"{current:,} treff i hele databasen før område- og målgruppefilter. ".replace(",", " ") +
+                       "Det filtrerte antallet gjelder bare de inntil 300 dokumentene som ble hentet.")
+        else:
+            st.markdown(f"**{current:,} dokumenttreff**".replace(",", " "))
         if current != overall:
             st.caption(f"{overall:,} treff totalt før informasjonstypefilter · ".replace(",", " ") +
                        f"Inntil {MAX_LIST_RESULTS} kandidater hentes til visning.")
@@ -1345,18 +1370,10 @@ def render_assistant(message, idx, show_feedback=True, last=False):
             candidates = message["raw_docs"]
         candidates = candidates or []
         total_candidates = len(candidates)
-        more_key = f"visible_docs_{message.get('id') or idx}"
-        shown = min(max(SOURCES_MAX, st.session_state.get(more_key, SOURCES_MAX)), total_candidates)
         if total_candidates:
-            st.caption(f"Viser {shown} av {total_candidates} hentede kandidater. "
-                       "Treffantallet over gjelder hele soket; listen inneholder bare kandidatene som ble hentet.")
-            with st.expander(f"🔎 Utforsk dokumenttreff ({shown} av {total_candidates})", expanded=False):
-                render_documents(candidates[:shown], f"{mid}_candidates", 1)
-                if shown < total_candidates:
-                    if st.button(f"Vis 30 flere ({total_candidates - shown} gjenstar)",
-                                 key=f"{more_key}_button", use_container_width=True):
-                        st.session_state[more_key] = min(shown + SOURCES_MAX, total_candidates)
-                        st.rerun()
+            st.caption(f"{total_candidates} hentede kandidater. Bla mellom sidene med 10 dokumenter per side.")
+            with st.expander(f"🔎 Utforsk dokumenttreff ({total_candidates})", expanded=False):
+                render_documents(candidates, f"{mid}_candidates", 1)
         elif "filtered_docs" in message:
             st.caption("Ingen dokumenter i det lagrede kandidatutvalget passer filtrene. "
                        "Prov et annet filter eller et nytt sporsmal.")
@@ -1409,6 +1426,14 @@ def nullstill_filtre():
     oppdater_siste_svar()
 
 
+def ny_samtale():
+    # Widget-verdier maa nullstilles i callback foer widgetene opprettes.
+    st.session_state.messages = []
+    st.session_state.session_id = uuid.uuid4().hex[:8]
+    nullstill_filtre()
+    st.session_state.pop("refresh_last", None)
+
+
 with st.sidebar:
     st.title("🔎 Finn tilbud")
     st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
@@ -1422,11 +1447,7 @@ with st.sidebar:
     with st.form("sporsmal_form", clear_on_submit=True):
         skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
-    if st.button("＋ Ny samtale", use_container_width=True, type="secondary"):
-        st.session_state.messages = []
-        nullstill_filtre()
-        st.session_state.pop("refresh_last", None)
-        st.rerun()
+    st.button("＋ Ny samtale", on_click=ny_samtale, use_container_width=True, type="secondary")
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
 
 valgte = aktive_filtre()
@@ -1437,69 +1458,22 @@ valgt_sortering = valgte["sortering"]
 
 st.markdown('<div class="hero"><h1>Hva kan vi hjelpe deg med?</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
 
-# Filtervalg bruker alltid lagrede sokekandidater, aldri nytt hybrid-/vektorsok.
-# Ved endret kildeutvalg oppdateres AI-svaret slik at kildehenvisningene er korrekte.
+# Filtrering er lokal og rask. AI-svar og nummererte AI-kilder endres ikke.
 if st.session_state.pop("refresh_last", False) and st.session_state.messages:
     last = st.session_state.messages[-1]
     if last.get("role") == "assistant" and last.get("raw_docs") is not None:
-        old_filters = last.get("filters") or {}
         docs = filter_and_sort_documents(
             [dict(d) for d in last["raw_docs"]],
-            valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering,
-        )
+            valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
         if valgt_sortering == "Mest relevant":
             docs = diversify(docs)
-        last["filtered_docs"] = [dict(d) for d in docs]
-        st.session_state[f"visible_docs_{last.get('id')}"] = SOURCES_MAX
+        last["filtered_docs"] = docs
         last["filtered_total"] = len(docs)
-        last["actual_total"] = count_full_search_matches(last.get("count_context"), valgt_type)
         last["filters"] = dict(valgte)
-
-        # Bare sortering: behold AI-svaret og nummererte kilder uendret.
-        # Andre filterendringer: generer nytt svar bare dersom AI-kildene endres.
-        changed_selection = any(old_filters.get(k) != valgte[k]
-                                for k in ("målgruppe", "område", "informasjonstype"))
-        new_ids = [d.get("doc_id") for d in docs[:AI_SOURCES]]
-        old_ids = last.get("ai_input_ids", [])
-        if not changed_selection or new_ids == old_ids:
-            last.pop("filter_update_error", None)
-        if changed_selection and new_ids != old_ids:
-            if not docs:
-                last["content"] = ("Jeg fant ingen dokumenter i de hentede søkeresultatene som "
-                                   "passer informasjonstypefilteret. Prøv et annet filter.")
-                last["sources"] = []
-                last["ai_input_ids"] = []
-                last["status"] = "ingen_treff"
-            else:
-                with st.spinner("Oppdaterer svaret for valgte filtre ..."):
-                    try:
-                        filter_context = (f"\nValgte søkefiltre: målgruppe={valgt_malgruppe}; "
-                                          f"område={valgt_omrade}; informasjonstype={valgt_type}. "
-                                          "Skill mellom aktiviteter i bydelen og kommuneomfattende tilbud. "
-                                          "Ikke anta fysisk plassering uten kildebelegg.")
-                        history = st.session_state.messages[:-2]
-                        answer, _usage = generate(last.get("query_corrected", last.get("query", ""))
-                                                  + filter_context, docs[:AI_SOURCES], history)
-                        answer = normalize_markdown(answer)
-                        no_sources = "INGEN_TREFF" in answer[:200]
-                        if no_sources:
-                            answer = re.sub(r"(?is)\W*INGEN_TREFF\s*:\s*", "", answer, count=1).strip()
-                            answer = re.sub(r"\s*\[\d+\]", "", answer)
-                        else:
-                            answer, ordered = renumber_sources(answer, docs)
-                        last["content"] = answer
-                        last["sources"] = [] if no_sources else ordered[:SOURCES_MAX]
-                        last["ai_input_ids"] = new_ids
-                        last["status"] = "ingen_relevante" if no_sources else "ok"
-                    except Exception as exc:
-                        # Behold gammelt svar og kilder ved API-feil, merk tydelig at de er gamle.
-                        last["filter_update_error"] = safe_api_error(exc)
-                    else:
-                        last.pop("filter_update_error", None)
-        elif changed_selection and not docs:
-            last["content"] = "Ingen dokumenter passer det valgte informasjonstypefilteret."
-            last["sources"] = []
-            last["ai_input_ids"] = []
+        st.session_state[f"page_{last.get('id')}_candidates"] = 1
+        # Tell bare hele databasen for informasjonstype; bydel og maalgruppe
+        # er avgrenset i de inntil 300 lagrede kandidatene.
+        last["actual_total"] = count_full_search_matches(last.get("count_context"), valgt_type)
 
 example_clicked = None
 if not st.session_state.messages:
