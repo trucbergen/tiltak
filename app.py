@@ -56,7 +56,7 @@ SHORT_QUERY_MIN_FTS = 10    # kort spoersmaal + minst saa mange noekkelordtreff 
 SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
-AI_SOURCES = 8
+AI_SOURCES = 5
 SHOW_SOURCES = 5  # antall dokumenter som vises under «Kilder» foerst
 SOURCES_MAX = 30   # antall dokumenter per utvidelse i kildelisten
 # Vage spoersmaal: mange treff spredt over mange deler av nettstedet -> be brukeren avgrense
@@ -67,9 +67,9 @@ VAGUE_MAX_SHARE = 0.35     # ... og ingen omraade har mer enn denne andelen
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 300
 PAGE_SIZE = 10  # dokumenter per side i kildelisten
-MAX_CONTEXT_CHARS = 1900
+MAX_CONTEXT_CHARS = 1200
 # gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
-GROQ_MAX_OUTPUT_TOKENS = 4000
+GROQ_MAX_OUTPUT_TOKENS = 2000
 GROQ_REASONING_EFFORT = "low"  # gpt-oss: low / medium / high
 STOPWORDS = set("skjer skjera hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
@@ -124,7 +124,7 @@ def secret(name):
 def groq_client(key):
     from groq import Groq
     # max_retries: SDK-en venter og proever igjen ved 429 (for mange forespoersler) og 5xx.
-    return Groq(api_key=key, timeout=60.0, max_retries=3)
+    return Groq(api_key=key, timeout=45.0, max_retries=0)
 
 
 def error_status(exc):
@@ -1071,10 +1071,32 @@ def generate_groq(user_prompt, recent):
     # Andre modeller (f.eks. Llama) tar ikke imot disse parameterne.
     extra = ({"reasoning_effort": GROQ_REASONING_EFFORT, "include_reasoning": False}
              if GROQ_MODEL.startswith("openai/gpt-oss") else {})
-    result = groq_client(key).chat.completions.create(
-        model=GROQ_MODEL, messages=messages, temperature=0.1,
-        max_tokens=GROQ_MAX_OUTPUT_TOKENS, extra_body=extra,
-    )
+    # Ett kontrollert forsok paa nytt ved midlertidig feil. SDK-retries er
+    # deaktivert, slik at vi unngaar flere skjulte, dyre foresporsler.
+    for attempt in range(2):
+        try:
+            result = groq_client(key).chat.completions.create(
+                model=GROQ_MODEL, messages=messages, temperature=0.1,
+                max_tokens=GROQ_MAX_OUTPUT_TOKENS, extra_body=extra,
+            )
+            break
+        except Exception as exc:
+            code = error_status(exc)
+            print(f"[groq] forsok={attempt + 1} modell={GROQ_MODEL} "
+                  f"status={code or 'ukjent'} feil={safe_api_error(exc)}", file=sys.stderr)
+            if attempt or not is_transient(exc):
+                raise
+            # Respekter kort Retry-After. Ved lengre rate limit ber vi
+            # brukeren vente fremfor aa holde Streamlit-kallet aapent.
+            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+            retry_after = headers.get("retry-after", "")
+            try:
+                wait = float(retry_after) if retry_after else 3.0
+            except (ValueError, TypeError):
+                wait = 3.0
+            if wait > 12:
+                raise
+            time.sleep(max(1.0, wait))
     choice = result.choices[0]
     text = (choice.message.content or "").strip()
     if not text:
@@ -1090,7 +1112,7 @@ def generate_groq(user_prompt, recent):
 def generate(question, docs, history):
     user_prompt = (f"SPØRSMÅL: {question}\n\nKILDER (bruk bare disse):\n{context(docs)}"
                    + FORMAT_REMINDER)
-    recent = [m for m in history[-4:] if m.get("role") in ("user", "assistant") and m.get("content")]
+    recent = [m for m in history[-2:] if m.get("role") in ("user", "assistant") and m.get("content")]
     return generate_groq(user_prompt, recent)
 
 
@@ -1539,12 +1561,21 @@ if question and question.strip():
                 except Exception as exc:
                     status = f"feil: {type(exc).__name__} {error_status(exc) or ''}".strip()
                     if is_transient(exc):
-                        answer = ("Tjenesten er midlertidig opptatt. Vent et minutt og prøv igjen. "
-                                  "Dokumentene som ble funnet, ligger under Kilder.")
+                        code = error_status(exc)
+                        if code == "429":
+                            answer = ("AI-tjenesten har naa en midlertidig bruksgrense (429). "
+                                      "Vent omtrent ett minutt og trykk «Søk og få svar» igjen. "
+                                      "Dokumenttreffene er fortsatt tilgjengelige nedenfor.")
+                        else:
+                            answer = ("AI-tjenesten svarte ikke akkurat naa "
+                                      f"(feilkode {code or 'timeout'}). Proev igjen om litt. "
+                                      "Dokumenttreffene ligger nedenfor.")
                     else:
                         answer = ("Det oppstod en feil da svaret skulle lages. "
                                   "Dokumentene som ble funnet, ligger under Kilder.")
         ai_input_ids = [d.get("doc_id") for d in docs[:AI_SOURCES]]
+        if status.startswith("feil:"):
+            print(f"[groq] svar mislyktes: {status}", file=sys.stderr)
         if docs and not hide_sources and not choices:
             answer, docs = renumber_sources(answer, docs)
         # raw_docs beholdes i opprinnelig sokerekkefolge for senere filterendringer.
