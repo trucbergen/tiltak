@@ -58,7 +58,7 @@ GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
 AI_SOURCES = 8
 SHOW_SOURCES = 5  # antall dokumenter som vises under «Kilder» foerst
-SOURCES_MAX = 30   # inntil saa mange dokumenter i kildelisten (Mest aktuelt + Andre treff)
+SOURCES_MAX = 30   # antall dokumenter per utvidelse i kildelisten
 # Vage spoersmaal: mange treff spredt over mange deler av nettstedet -> be brukeren avgrense
 VAGUE_MIN_HITS = 100       # minst saa mange noekkelordtreff
 VAGUE_MAX_WORDS = 3        # og hoeyst saa mange innholdsord i spoersmaalet
@@ -66,7 +66,7 @@ VAGUE_MIN_SECTIONS = 5     # treffene fordeler seg paa minst saa mange omraader 
 VAGUE_MAX_SHARE = 0.35     # ... og ingen omraade har mer enn denne andelen
 MAX_CANDIDATES = 15
 MAX_LIST_RESULTS = 300
-PAGE_SIZE = 10  # dokumenter per side i kildelisten
+PAGE_SIZE = 30  # dokumenter per side i kildelisten
 MAX_CONTEXT_CHARS = 1900
 # gpt-oss bruker tokens paa intern resonnering for selve svaret: god margin.
 GROQ_MAX_OUTPUT_TOKENS = 4000
@@ -1311,6 +1311,8 @@ def render_assistant(message, idx, show_feedback=True, last=False):
                 if st.button(label, key=f"ch_{message.get('id')}_{n}", use_container_width=True):
                     st.session_state["pending_q"] = f"{message.get('query', '')} {label.lower()}".strip()
                     st.rerun()
+    # AI-kildene beholder sine opprinnelige numre. Flere dokumenter vises
+    # fra lagrede kandidater, uten nytt databasesok eller Groq-kall.
     docs = message.get("sources") or []
     if docs:
         if message.get("filters"):
@@ -1322,34 +1324,38 @@ def render_assistant(message, idx, show_feedback=True, last=False):
             if aktive_etiketter:
                 st.markdown("**Valgte filtre:** " + " · ".join(aktive_etiketter))
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
-        total = message.get("total", len(docs))
         mid = str(message.get("id") or idx)
-        aktuelt, andre = split_sources(docs, message.get("query") or "")
-        with st.expander(f"📄 Dokumenter og kilder ({len(docs)})"):
-            fane1, fane2 = st.tabs([f"Mest aktuelt ({len(aktuelt)})", f"Andre treff ({len(andre)})"])
-            with fane1:
-                if any(d.get("_brukt") for d in aktuelt):
-                    st.caption("Kildene merket «✓ Brukt i svaret» har samme nummer som [1], [2] … i teksten. "
-                               "Deretter følger sider om samme sted eller samme tema.")
-                render_documents(aktuelt, f"{mid}_a", 1)
-                if not aktuelt:
-                    st.caption("Ingen dokumenter her.")
-            with fane2:
-                st.caption("Disse dokumentene inneholder søkeordene, men svaret bygger ikke på dem. "
-                           "De kan handle om andre temaer, for eksempel et ord som bare nevnes i forbifarten.")
-                render_documents(andre, f"{mid}_b", len(aktuelt) + 1)
-                if not andre:
-                    st.caption("Ingen andre treff.")
-    if "filtered_docs" in message:
-        filtered = message["filtered_docs"]
-        st.info("Filtrene endrer bare dokumenttreffene nedenfor. AI-svaret over er fra det opprinnelige spørsmålet og er ikke generert på nytt.")
-        st.caption(f"Viser {len(filtered)} av {message.get('actual_total', 0):,} dokumenttreff i hele databasen (innenfor lagret kandidat-utvalg).".replace(",", " "))
-        with st.expander(f"🔎 Filtrerte dokumenttreff ({len(filtered)} vist)", expanded=True):
-            if filtered:
-                # Bruk separat kildevisning, uten å endre siteringsnumrene i AI-svaret.
-                render_documents(filtered, f"{message.get('id') or idx}_filter", 1)
-            else:
-                st.caption("Ingen dokumenttreff passer filtrene innenfor det opprinnelige søket. Prøv å nullstille filtrene eller still et nytt spørsmål.")
+        # Etter filterendring vises opprinnelige AI-kilder fortsatt separat,
+        # mens den filtrerte kandidatlisten ligger nedenfor.
+        with st.expander(f"📄 Dokumenter og kilder ({len(docs)} AI-kilder)"):
+            st.caption("Numrene [1], [2] osv. i AI-svaret viser til disse opprinnelige kildene.")
+            render_documents(docs, f"{mid}_sources", 1)
+
+    # Lagret kandidatsett (inntil 300) vises trinnvis, 30 av gangen.
+    # raw_docs er hentet ved forste sporsmal og oppdateres ikke ved filtervalg.
+    if message.get("raw_docs") is not None:
+        if "filtered_docs" in message:
+            candidates = message["filtered_docs"]
+            st.info("Filtrene endrer bare dokumenttreffene nedenfor. AI-svaret og kildehenvisningene over er ikke generert på nytt.")
+        else:
+            candidates = message["raw_docs"]
+        candidates = candidates or []
+        total_candidates = len(candidates)
+        more_key = f"visible_docs_{message.get('id') or idx}"
+        shown = min(max(SOURCES_MAX, st.session_state.get(more_key, SOURCES_MAX)), total_candidates)
+        if total_candidates:
+            st.caption(f"Viser {shown} av {total_candidates} hentede kandidater. "
+                       "Treffantallet over gjelder hele soket; listen inneholder bare kandidatene som ble hentet.")
+            with st.expander(f"🔎 Utforsk dokumenttreff ({shown} av {total_candidates})", expanded=False):
+                render_documents(candidates[:shown], f"{mid}_candidates", 1)
+                if shown < total_candidates:
+                    if st.button(f"Vis 30 flere ({total_candidates - shown} gjenstar)",
+                                 key=f"{more_key}_button", use_container_width=True):
+                        st.session_state[more_key] = min(shown + SOURCES_MAX, total_candidates)
+                        st.rerun()
+        elif "filtered_docs" in message:
+            st.caption("Ingen dokumenter i det lagrede kandidatutvalget passer filtrene. "
+                       "Prov et annet filter eller et nytt sporsmal.")
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1440,7 +1446,8 @@ if st.session_state.pop("refresh_last", False) and st.session_state.messages:
             docs = diversify(docs)
         # De opprinnelige AI-kildene bevares, selv om de ikke matcher et nytt filter.
         # De vises separat, slik at [1], [2] osv. fortsatt er korrekte.
-        last["filtered_docs"] = docs[:SOURCES_MAX]
+        last["filtered_docs"] = docs[:MAX_LIST_RESULTS]
+        st.session_state[f"visible_docs_{last.get('id')}"] = SOURCES_MAX
         last["filtered_total"] = len(docs)
         last["actual_total"] = count_full_search_matches(last.get("count_context"), valgt_type)
         last["filters"] = dict(valgte)
@@ -1527,6 +1534,12 @@ if question and question.strip():
                                   "Dokumentene som ble funnet, ligger under Kilder.")
         if docs and not hide_sources and not choices:
             answer, docs = renumber_sources(answer, docs)
+        # Behold AI-kildene forst i kandidatlisten, slik at numrene i svaret
+        # ikke forveksles med en tilfeldig sortering fra sokemotoren.
+        if docs:
+            prioritet = {d.get("doc_id") for d in docs}
+            raw_docs = [dict(d) for d in docs] + [d for d in raw_docs if d.get("doc_id") not in prioritet]
+            raw_docs = raw_docs[:MAX_LIST_RESULTS]
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
         note = ("Søkte på " + ", ".join(f"«{r}»" for _, r in spell_fixes)
