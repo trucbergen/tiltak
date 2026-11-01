@@ -88,15 +88,15 @@ section[data-testid="stSidebar"] hr {margin: .35rem 0 !important;}
 /* Noytrale handlingsknapper: mindre dominerende enn rod primarfarge. */
 section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"],
 section[data-testid="stSidebar"] button[kind="secondary"] {
-  border-color: #cbd5e1;
-  background: #f8fafc;
+  border-color: #b6c0cb;
+  background: #e2e6eb;
   color: #263445;
   font-weight: 600;
 }
 section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"]:hover,
 section[data-testid="stSidebar"] button[kind="secondary"]:hover {
-  border-color: #94a3b8;
-  background: #e9eef4;
+  border-color: #8795a5;
+  background: #d3d9e0;
   color: #172638;
 }
 .block-container {max-width: 1150px; padding-top: 1.5rem; padding-bottom: 4rem;}
@@ -1298,7 +1298,7 @@ def nullstill_filtre():
 
 
 with st.sidebar:
-    st.title("🔎 Finn kommunale tilbud")
+    st.title("🔎 Finn tilbud")
     # Hold ny samtale synlig over filtrene og det store sporsmalsfeltet.
     if st.button("＋ Ny samtale", use_container_width=True, type="secondary"):
         st.session_state.messages = []
@@ -1322,7 +1322,7 @@ valgt_omrade = valgte["område"]
 valgt_type = valgte["informasjonstype"]
 valgt_sortering = valgte["sortering"]
 
-st.markdown('<div class="hero"><h1>Kommunal dokumentassistent</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>Hva kan vi hjelpe deg med?</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
 
 # Filterendringer skal ALDRI kalle Groq eller kjore nytt databasesok.
 # Det opprinnelige AI-svaret og kildenumrene er uforandret.
