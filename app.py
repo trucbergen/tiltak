@@ -1372,46 +1372,59 @@ def render_assistant(message, idx, show_feedback=True, last=False):
 
 
 def scroll_to_latest_answer():
-    """Place the newest user question near the top of the visible Streamlit page.
+    """Rull til siste brukersporsmal etter at Streamlit har tegnet chatten.
 
-    Only invoked after a newly completed answer, never for expander or sort changes.
+    Streamlit kan selv rulle til bunnen ved chat_input og ved rerun. Vi bruker
+    derfor flere korte, tidsavgrensede forsok mot riktig rullecontainer.
     """
     components.html("""<script>
     (function () {
       try {
         const doc = window.parent.document;
-        let attempts = 0;
-        function focusNewestQuestion() {
-          const messages = doc.querySelectorAll('[data-testid="stChatMessage"]');
-          const questions = Array.from(messages).filter(el =>
-            el.getAttribute('aria-label')?.toLowerCase().includes('user') ||
-            el.querySelector('[data-testid="stChatMessageAvatarUser"]')
+        const started = Date.now();
+        let lastTop = null;
+        let stable = 0;
+
+        function findScrollParent(el) {
+          let node = el.parentElement;
+          while (node && node !== doc.body) {
+            const style = window.parent.getComputedStyle(node);
+            if (/(auto|scroll)/.test(style.overflowY) &&
+                node.scrollHeight > node.clientHeight + 2) return node;
+            node = node.parentElement;
+          }
+          return doc.scrollingElement || doc.documentElement;
+        }
+
+        function moveToNewest() {
+          const messages = Array.from(doc.querySelectorAll('[data-testid="stChatMessage"]'));
+          const users = messages.filter(el =>
+            (el.getAttribute('aria-label') || '').toLowerCase().includes('user') ||
+            !!el.querySelector('[data-testid="stChatMessageAvatarUser"]')
           );
-          // The last two chat messages are the new user question and AI answer.
-          // Prefer the user message identified by its avatar; use penultimate
-          // message as a fallback for Streamlit versions with different markup.
-          const target = questions.length ? questions[questions.length - 1]
-                                          : messages.length >= 2 ? messages[messages.length - 2] : null;
+          const target = users.length ? users[users.length - 1] :
+                         messages.length >= 2 ? messages[messages.length - 2] : null;
           if (!target) {
-            if (++attempts < 15) window.setTimeout(focusNewestQuestion, 150);
+            if (Date.now() - started < 2500) window.setTimeout(moveToNewest, 120);
             return;
           }
-          const scrollContainer = target.closest('[data-testid="stMain"]') ||
-                                  doc.querySelector('[data-testid="stAppViewContainer"]');
-          const topPadding = 20;
-          const rect = target.getBoundingClientRect();
-          const scroller = scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight
-                           ? scrollContainer : doc.scrollingElement;
-          if (scroller) {
-            const scrollerTop = scroller.getBoundingClientRect().top;
-            scroller.scrollTo({top: scroller.scrollTop + rect.top - scrollerTop - topPadding,
-                               behavior: 'instant'});
-          } else {
-            target.scrollIntoView({behavior: 'instant', block: 'start'});
+          const scroller = findScrollParent(target);
+          const targetRect = target.getBoundingClientRect();
+          const scrollRect = scroller.getBoundingClientRect();
+          const desired = Math.max(0, scroller.scrollTop + targetRect.top - scrollRect.top - 16);
+          scroller.scrollTop = desired;
+
+          const currentTop = target.getBoundingClientRect().top;
+          if (lastTop !== null && Math.abs(currentTop - lastTop) < 3) stable++;
+          else stable = 0;
+          lastTop = currentTop;
+          // Gi Streamlit tid til a fullfore rerun og eventuell egen auto-scroll.
+          if (Date.now() - started < 2200 && (stable < 3 || Date.now() - started < 650)) {
+            window.setTimeout(moveToNewest, 130);
           }
         }
-        window.setTimeout(focusNewestQuestion, 180);
-      } catch (e) { /* Ignore iframe permission or DOM differences. */ }
+        window.setTimeout(moveToNewest, 100);
+      } catch (e) { /* Ulik Streamlit-versjon eller blokkert iframe. */ }
     })();
     </script>""", height=0)
 
