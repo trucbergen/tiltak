@@ -1312,8 +1312,11 @@ def render_assistant(message, idx, show_feedback=True, last=False):
         for k in ("målgruppe", "område", "informasjonstype", "sortering")
     )
     if changed_filters:
-        st.info("Du har endret filtrene. Svaret nedenfor gjelder det forrige søket. "
-                "Skriv spørsmålet på nytt og trykk «Søk og få svar» for å se resultater med de nye filtrene.")
+        labels = [str(current_filters[k]) for k in ("målgruppe", "område", "informasjonstype")
+                  if current_filters.get(k) not in (None, "Alle", "Hele Bergen")]
+        valgt = " og ".join(labels) if labels else "Hele Bergen"
+        st.info(f"Du har valgt {valgt}. Trykk «Søk og få svar» for å se oppdaterte tilbud.")
+        return
     if saved_filters:
         labels = [str(saved_filters.get(k)) for k in ("målgruppe", "område", "informasjonstype")
                   if saved_filters.get(k) not in (None, "Alle", "Hele Bergen")]
@@ -1407,8 +1410,12 @@ def aktive_filtre():
 
 
 def oppdater_siste_svar():
-    # Ingen automatisk oppdatering: filtrene brukes ved neste soek.
-    pass
+    # Behold det siste spørsmålet klart for nytt søk med nye filtre.
+    if st.session_state.get("messages"):
+        for m in reversed(st.session_state.messages):
+            if m.get("role") == "user":
+                st.session_state["sporsmal_input"] = m.get("content", "")
+                break
 
 
 def nullstill_filtre():
@@ -1416,6 +1423,7 @@ def nullstill_filtre():
     st.session_state["filter_omrade"] = "Hele Bergen"
     st.session_state["filter_type"] = "Alle"
     st.session_state["filter_sortering"] = "Mest relevant"
+    oppdater_siste_svar()
 
 
 def ny_samtale():
@@ -1424,20 +1432,21 @@ def ny_samtale():
     st.session_state.session_id = uuid.uuid4().hex[:8]
     nullstill_filtre()
     st.session_state.pop("refresh_last", None)
+    st.session_state["sporsmal_input"] = ""
 
 
 with st.sidebar:
     st.title("🔎 Finn tilbud")
     st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
-    st.caption("Velg filtre, skriv et spørsmål og trykk Søk og få svar. Endrer du filtrene, må du søke på nytt.")
-    st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe")
-    st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade")
-    st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type")
-    st.radio("Sortering", ["Mest relevant", "Nyeste først"], key="filter_sortering")
+    st.caption("Velg hvem og hvor du søker etter tilbud.")
+    st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
+    st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
+    st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type", on_change=oppdater_siste_svar)
+    st.radio("Sortering", ["Mest relevant", "Nyeste først"], key="filter_sortering", on_change=oppdater_siste_svar)
     st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
     st.divider()
-    with st.form("sporsmal_form", clear_on_submit=True):
-        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
+    with st.form("sporsmal_form", clear_on_submit=False):
+        skrevet = st.text_area("Still et spørsmål", key="sporsmal_input", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
     st.button("＋ Ny samtale", on_click=ny_samtale, use_container_width=True, type="secondary")
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
