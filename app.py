@@ -1254,15 +1254,15 @@ def render_documents(docs, key, start=1):
             merke = "  :green[✓ Brukt i svaret]" if doc.get("_brukt") else ""
             st.markdown(f"**{i}. {title}**{merke}")
             sti = page_path(doc.get("url"))
-            st.caption(" · ".join(x for x in [page_type(doc.get("url")), sti,
-                                              doc.get("dokumentdato") or "Udatert"] if x))
+            st.caption(" · ".join(str(x) for x in [page_type(doc.get("url")), sti,
+                                                   doc.get("dokumentdato") or "Udatert"] if x))
             details = [
                 f"Type: {doc.get('informasjonstype')}" if doc.get('informasjonstype') else "",
                 f"Målgruppe: {doc.get('malgruppe')}" if doc.get('malgruppe') else "",
                 f"Bydeler: {doc.get('bydeler')}" if doc.get('bydeler') else "",
             ]
             if any(details):
-                st.caption(" · ".join(x for x in details if x))
+                st.caption(" · ".join(str(x) for x in details if x))
             st.markdown(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
@@ -1297,7 +1297,12 @@ def render_assistant(message, idx, show_feedback=True, last=False):
     if docs:
         if message.get("filters"):
             f = message["filters"]
-            st.caption("Valgt: " + " · ".join(str(f.get(k)) for k in ("målgruppe", "område", "informasjonstype") if f.get(k) not in ("Alle", "Hele Bergen"))) if any(f.get(k) not in ("Alle", "Hele Bergen", None) for k in ("målgruppe", "område", "informasjonstype")) else None
+            aktive_etiketter = [
+                str(f[k]) for k in ("målgruppe", "område", "informasjonstype")
+                if f.get(k) not in (None, "Alle", "Hele Bergen")
+            ]
+            if aktive_etiketter:
+                st.markdown("**Valgte filtre:** " + " · ".join(aktive_etiketter))
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
         mid = str(message.get("id") or idx)
