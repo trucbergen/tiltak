@@ -1401,6 +1401,7 @@ def nullstill_filtre():
 
 with st.sidebar:
     st.title("🔎 Finn tilbud")
+    st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
     st.caption("Velg filtre én gang. De gjelder også neste spørsmål.")
     st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
     st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
