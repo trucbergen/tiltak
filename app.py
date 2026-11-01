@@ -319,18 +319,30 @@ def search_documents(question):
     if not important:
         important = [w for w in words if w not in generic] or words
 
-    # Lengre fagord har ofte stor verdi, men behold ogsa noen korte ord.
-    core = sorted(important, key=lambda w: (-len(w), words.index(w)))[:6]
+    # Behold sentrale fagord i opprinnelig rekkefolge. For brede spoersmaal
+    # brukes OR mellom temaene i stedet for aa kreve at de finnes sammen.
+    # Fjern generelle sporreord som ellers gir urelaterte treff.
+    broad_generic = {"hvilke", "hvilken", "hvilket", "tjenester", "tjeneste",
+                     "tilbud", "aktiviteter", "aktivitet", "finnes", "særlig"}
+    topical = [w for w in important if w not in broad_generic]
+    core = sorted(topical or important, key=lambda w: (-len(w), words.index(w)))[:8]
+    is_broad = len(topical) >= 4 or len(words_from_question(question)) >= 7
 
     def quote_word(w):
         star = "*" if len(w) >= PREFIX_MIN else ""
         return '"' + w.replace('"', '') + '"' + star
 
-    # Soketrinn: alle ord, de viktigste tre, sa minst to av de fem viktigste.
-    queries = [("AND", " AND ".join(map(quote_word, words)))]
-    if len(core) >= 3:
+    # Brede spoersmaal: tell alle dokumenter som matcher minst ett fagtema.
+    # Begrens bare kandidatlisten til MAX_LIST_RESULTS, ikke COUNT(*).
+    # Et presist AND-uttrykk brukes fortsatt for korte, konkrete spoersmaal.
+    queries = []
+    if is_broad:
+        queries.append(("BREDE_TEMA", " OR ".join(map(quote_word, core))))
+    else:
+        queries.append(("AND", " AND ".join(map(quote_word, words))))
+    if not is_broad and len(core) >= 3:
         queries.append(("KJERNE", " AND ".join(map(quote_word, core[:3]))))
-    if len(core) >= 2:
+    if not is_broad and len(core) >= 2:
         pairs = list(combinations(core[:5], 2))
         pair_query = " OR ".join(
             "(" + quote_word(x) + " AND " + quote_word(y) + ")"
@@ -341,7 +353,7 @@ def search_documents(question):
         # har begge ordene). BM25 rangerer sider med flest og sjeldnest ord oeverst.
         if len(core) <= 3:
             queries.append(("MINST_1", " OR ".join(map(quote_word, core[:5]))))
-    elif len(core) == 1:
+    elif not is_broad and len(core) == 1:
         queries.append(("ETT_FAGORD", quote_word(core[0])))
 
     # FTS5 bm25: lavere verdi er bedre. Tittel, tema og malgruppe
@@ -1474,7 +1486,9 @@ if question and question.strip():
         t0 = time.perf_counter()
         status = "ok"
         hide_sources = False   # True naar modellen svarer at ingen kilder er relevante
-        choices = vague_topics(question, docs, total) if docs else []
+        # Ikke stopp svaret ved mange treff. Rangering og filtre skal hjelpe
+        # innbyggeren videre uten aa kreve et nytt spoersmaal.
+        choices = []
         if choices:
             status = "avklaring"
             answer = ("Spørsmålet ditt gir mange treff innen ulike områder. "
