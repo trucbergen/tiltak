@@ -1388,18 +1388,30 @@ def render_assistant(message, idx, show_feedback=True, last=False):
                 st.caption("✓ Vurderingen er lagret. Skriv gjerne en kommentar.")
 
 
-def scroll_to_latest_answer():
-    """Align latest user message after a completed response, not on widget reruns.
+def scroll_to_latest_answer(max_ms=6000):
+    """Hold the newest user question at the top of the view (question first, answer below).
 
-    Streamlit may scroll independently. Find the actual chat container, add
-    bottom space only if necessary, and align after layout stabilizes.
+    Streamlit's chat layout sticks to the bottom when content grows, so a single
+    scroll is overridden. Re-align repeatedly until max_ms, but stop as soon as
+    the user scrolls/touches/presses a key. A nonce forces a fresh iframe each run.
     """
+    nonce = uuid.uuid4().hex
     components.html(r"""<script>
+    /* nonce: __NONCE__ */
     (function () {
       try {
         const win = window.parent, doc = win.document;
-        const started = Date.now(), maxDuration = 4200;
-        let lastHeight = -1, stable = 0;
+        const started = Date.now(), maxDuration = __MAXMS__, gap = 14;
+        let stopped = false, timer = null;
+
+        function stop() {
+          stopped = true;
+          if (timer) window.clearInterval(timer);
+          ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(
+            ev => doc.removeEventListener(ev, stop, true));
+        }
+        ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(
+          ev => doc.addEventListener(ev, stop, {capture: true, passive: true}));
 
         function newestUser() {
           const all = [...doc.querySelectorAll('[data-testid="stChatMessage"]')];
@@ -1408,51 +1420,41 @@ def scroll_to_latest_answer():
             !!el.querySelector('[data-testid="stChatMessageAvatarUser"]'));
           return users.length ? users[users.length - 1] : null;
         }
-        function scrollingParent(el) {
+        function scrollers(el) {
+          const out = [];
           let p = el.parentElement;
           while (p && p !== doc.body) {
-            const style = win.getComputedStyle(p);
-            if (/(auto|scroll)/.test(style.overflowY) &&
-                p.scrollHeight > p.clientHeight + 3) return p;
+            const oy = win.getComputedStyle(p).overflowY;
+            if (/(auto|scroll)/.test(oy) && p.scrollHeight > p.clientHeight + 3) out.push(p);
             p = p.parentElement;
           }
-          return doc.scrollingElement || doc.documentElement;
+          out.push(doc.scrollingElement || doc.documentElement);
+          return out;
         }
         function align() {
           const q = newestUser();
-          if (!q) return false;
-          const scroller = scrollingParent(q);
-          const isDoc = scroller === doc.scrollingElement || scroller === doc.documentElement;
-          const top = isDoc ? 0 : scroller.getBoundingClientRect().top;
-          const rect = q.getBoundingClientRect();
-          const viewportHeight = isDoc ? win.innerHeight : scroller.clientHeight;
-          const available = scroller.scrollHeight - scroller.scrollTop - viewportHeight;
-          const needed = Math.max(0, rect.top - top - 14 - available);
-          // Reserve space after the conversation so even short answers can be aligned.
+          if (!q) return;
+          // Room below the conversation so even short answers can sit under the question.
           const main = q.closest('[data-testid="stMainBlockContainer"]') ||
                        q.closest('.block-container');
           if (main) main.style.paddingBottom = 'max(85vh, 720px)';
-          const delta = q.getBoundingClientRect().top - top - 14;
-          scroller.scrollTop += delta;
-          return true;
-        }
-        function check() {
-          const q = newestUser();
-          if (!q) {
-            if (Date.now() - started < maxDuration) win.setTimeout(check, 120);
-            return;
+          for (const s of scrollers(q)) {
+            const isDoc = s === doc.scrollingElement || s === doc.documentElement;
+            const top = isDoc ? 0 : s.getBoundingClientRect().top;
+            const delta = q.getBoundingClientRect().top - top - gap;
+            if (Math.abs(delta) > 2) s.scrollTop += delta;
           }
-          const height = doc.body.scrollHeight;
-          stable = height === lastHeight ? stable + 1 : 0;
-          lastHeight = height;
-          align();
-          if (Date.now() - started < maxDuration && stable < 7)
-            win.setTimeout(check, 140);
         }
-        win.setTimeout(check, 160);
+        function tick() {
+          if (stopped) return;
+          if (Date.now() - started > maxDuration) { stop(); return; }
+          align();
+        }
+        window.setTimeout(tick, 60);
+        timer = window.setInterval(tick, 120);
       } catch (e) { /* Embedded browser restrictions: leave normal scrolling. */ }
     })();
-    </script>""", height=0)
+    </script>""".replace("__NONCE__", nonce).replace("__MAXMS__", str(int(max_ms))), height=0)
 
 
 def is_context_followup(question, history):
@@ -1571,6 +1573,8 @@ if question and question.strip():
     with st.chat_message("user"):
         st.markdown(asked)
     with st.chat_message("assistant"):
+        # Vis spoersmaalet oeverst straks, mens svaret lages under det.
+        scroll_to_latest_answer(max_ms=60000)
         try:
             with st.spinner("Søker i dokumentene ..."):
                 # For references like "these", keep the exact documents used in the
