@@ -1336,7 +1336,11 @@ def render_assistant(message, idx, show_feedback=True, last=False):
     if message.get("raw_docs") is not None:
         if "filtered_docs" in message:
             candidates = message["filtered_docs"]
-            st.info("Filtrene endrer bare dokumenttreffene nedenfor. AI-svaret og kildehenvisningene over er ikke generert på nytt.")
+            if message.get("filter_update_error"):
+                st.warning("Kunne ikke oppdatere AI-svaret. Kildene over gjelder forrige filtervalg. "
+                           "Prøv å endre filteret igjen.")
+            else:
+                st.caption("Dokumenttreffene er oppdatert fra lagret søk, uten ny vektorisering.")
         else:
             candidates = message["raw_docs"]
         candidates = candidates or []
@@ -1420,6 +1424,7 @@ with st.sidebar:
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
     if st.button("＋ Ny samtale", use_container_width=True, type="secondary"):
         st.session_state.messages = []
+        nullstill_filtre()
         st.session_state.pop("refresh_last", None)
         st.rerun()
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
@@ -1432,25 +1437,69 @@ valgt_sortering = valgte["sortering"]
 
 st.markdown('<div class="hero"><h1>Hva kan vi hjelpe deg med?</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
 
-# Filterendringer skal ALDRI kalle Groq eller kjore nytt databasesok.
-# Det opprinnelige AI-svaret og kildenumrene er uforandret.
-# Bare dokumenttreffene oppdateres fra raw_docs i sesjonsminnet.
+# Filtervalg bruker alltid lagrede sokekandidater, aldri nytt hybrid-/vektorsok.
+# Ved endret kildeutvalg oppdateres AI-svaret slik at kildehenvisningene er korrekte.
 if st.session_state.pop("refresh_last", False) and st.session_state.messages:
     last = st.session_state.messages[-1]
     if last.get("role") == "assistant" and last.get("raw_docs") is not None:
+        old_filters = last.get("filters") or {}
         docs = filter_and_sort_documents(
             [dict(d) for d in last["raw_docs"]],
             valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering,
         )
         if valgt_sortering == "Mest relevant":
             docs = diversify(docs)
-        # De opprinnelige AI-kildene bevares, selv om de ikke matcher et nytt filter.
-        # De vises separat, slik at [1], [2] osv. fortsatt er korrekte.
-        last["filtered_docs"] = docs[:MAX_LIST_RESULTS]
+        last["filtered_docs"] = [dict(d) for d in docs]
         st.session_state[f"visible_docs_{last.get('id')}"] = SOURCES_MAX
         last["filtered_total"] = len(docs)
         last["actual_total"] = count_full_search_matches(last.get("count_context"), valgt_type)
         last["filters"] = dict(valgte)
+
+        # Bare sortering: behold AI-svaret og nummererte kilder uendret.
+        # Andre filterendringer: generer nytt svar bare dersom AI-kildene endres.
+        changed_selection = any(old_filters.get(k) != valgte[k]
+                                for k in ("målgruppe", "område", "informasjonstype"))
+        new_ids = [d.get("doc_id") for d in docs[:AI_SOURCES]]
+        old_ids = last.get("ai_input_ids", [])
+        if not changed_selection or new_ids == old_ids:
+            last.pop("filter_update_error", None)
+        if changed_selection and new_ids != old_ids:
+            if not docs:
+                last["content"] = ("Jeg fant ingen dokumenter i de hentede søkeresultatene som "
+                                   "passer informasjonstypefilteret. Prøv et annet filter.")
+                last["sources"] = []
+                last["ai_input_ids"] = []
+                last["status"] = "ingen_treff"
+            else:
+                with st.spinner("Oppdaterer svaret for valgte filtre ..."):
+                    try:
+                        filter_context = (f"\nValgte søkefiltre: målgruppe={valgt_malgruppe}; "
+                                          f"område={valgt_omrade}; informasjonstype={valgt_type}. "
+                                          "Skill mellom aktiviteter i bydelen og kommuneomfattende tilbud. "
+                                          "Ikke anta fysisk plassering uten kildebelegg.")
+                        history = st.session_state.messages[:-2]
+                        answer, _usage = generate(last.get("query_corrected", last.get("query", ""))
+                                                  + filter_context, docs[:AI_SOURCES], history)
+                        answer = normalize_markdown(answer)
+                        no_sources = "INGEN_TREFF" in answer[:200]
+                        if no_sources:
+                            answer = re.sub(r"(?is)\W*INGEN_TREFF\s*:\s*", "", answer, count=1).strip()
+                            answer = re.sub(r"\s*\[\d+\]", "", answer)
+                        else:
+                            answer, ordered = renumber_sources(answer, docs)
+                        last["content"] = answer
+                        last["sources"] = [] if no_sources else ordered[:SOURCES_MAX]
+                        last["ai_input_ids"] = new_ids
+                        last["status"] = "ingen_relevante" if no_sources else "ok"
+                    except Exception as exc:
+                        # Behold gammelt svar og kilder ved API-feil, merk tydelig at de er gamle.
+                        last["filter_update_error"] = safe_api_error(exc)
+                    else:
+                        last.pop("filter_update_error", None)
+        elif changed_selection and not docs:
+            last["content"] = "Ingen dokumenter passer det valgte informasjonstypefilteret."
+            last["sources"] = []
+            last["ai_input_ids"] = []
 
 example_clicked = None
 if not st.session_state.messages:
@@ -1532,14 +1581,10 @@ if question and question.strip():
                     else:
                         answer = ("Det oppstod en feil da svaret skulle lages. "
                                   "Dokumentene som ble funnet, ligger under Kilder.")
+        ai_input_ids = [d.get("doc_id") for d in docs[:AI_SOURCES]]
         if docs and not hide_sources and not choices:
             answer, docs = renumber_sources(answer, docs)
-        # Behold AI-kildene forst i kandidatlisten, slik at numrene i svaret
-        # ikke forveksles med en tilfeldig sortering fra sokemotoren.
-        if docs:
-            prioritet = {d.get("doc_id") for d in docs}
-            raw_docs = [dict(d) for d in docs] + [d for d in raw_docs if d.get("doc_id") not in prioritet]
-            raw_docs = raw_docs[:MAX_LIST_RESULTS]
+        # raw_docs beholdes i opprinnelig sokerekkefolge for senere filterendringer.
         # Svaret lagres som 'content', slik at det ogsaa brukes som samtalehistorikk.
         answer_id = uuid.uuid4().hex[:10]
         note = ("Søkte på " + ", ".join(f"«{r}»" for _, r in spell_fixes)
@@ -1551,7 +1596,8 @@ if question and question.strip():
                                "informasjonstype": valgt_type, "sortering": valgt_sortering},
                    "id": answer_id, "raw_docs": raw_docs, "query_corrected": question,
                    "count_context": count_context, "actual_total": actual_total,
-                   "all_total": all_total}
+                   "all_total": all_total,
+                   "ai_input_ids": ai_input_ids}
         top = docs[:AI_SOURCES]
         log_event("svar", [
             now_str(), answer_id, tester_id(), st.session_state.session_id, question, answer,
