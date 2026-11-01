@@ -805,10 +805,14 @@ def rank_for_question(docs, question):
                 pts -= 14
             if page_type(url) in ("Politikk", "Nyheter og aktuelt"):
                 pts -= 12
+            policy = page_type(url) == "Politikk" or bool(re.search(
+                r"budsjett|satser på|vedtak|bevilg|handlingsplan|økonomiplan|høring", title))
             if re.search(r"rapport|kartlegg|undersøk|budsjett|forskning|statistikk|strategi", title):
                 pts -= 13
-            # (1) Hva brukeren spoer etter: aktivitet teller mest.
-            if activity:
+            if policy:
+                pts -= 20   # budsjett/politikk beskriver planer, ikke tilbud man kan bruke
+            # (1) Hva brukeren spoer etter: aktivitet teller mest (ikke for budsjettsider).
+            if activity and not policy:
                 in_activity_area = any(s in url for s in ACTIVITY_SECTIONS) or \
                     re.search(r"fritid|idrett|kultur", tema)
                 title_activity = re.search(ACTIVITY_TERMS, title)
@@ -1592,8 +1596,12 @@ def previous_answer_sources(history):
         return []
     docs = previous.get("sources") or []
     allowed = set(previous.get("ai_input_ids") or [])
-    return [dict(d) for d in docs if d.get("doc_id") is not None
+    pool = [dict(d) for d in docs if d.get("doc_id") is not None
             and (not allowed or d.get("doc_id") in allowed)][:AI_SOURCES]
+    # Bare tilbud som faktisk ble nevnt ([n]) i forrige svar; ellers alle modellen fikk.
+    cited = {int(n) for n in re.findall(r"\[(\d+)\]", str(previous.get("content") or ""))}
+    shown = [d for i, d in enumerate(docs, 1) if i in cited and d.get("doc_id") is not None]
+    return [dict(d) for d in shown][:AI_SOURCES] or pool
 
 if not DB_PATH.is_file():
     st.error("Dokumentdatabasen er ikke tilgjengelig. Kontakt den som drifter tjenesten.")
