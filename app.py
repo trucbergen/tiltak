@@ -8,6 +8,7 @@ Secrets: GROQ_API_KEY.
 from __future__ import annotations
 
 import html
+import streamlit.components.v1 as components
 import json
 import os
 import re
@@ -1370,6 +1371,26 @@ def render_assistant(message, idx, show_feedback=True, last=False):
                 st.caption("✓ Vurderingen er lagret. Skriv gjerne en kommentar.")
 
 
+def scroll_to_latest_answer():
+    """Scroll main page to the newest answer after a Streamlit rerun.
+
+    Runs in a tiny Streamlit component. If the host disallows access to the
+    parent document, the rest of the app continues normally.
+    """
+    components.html("""<script>
+    (function () {
+      try {
+        const doc = window.parent.document;
+        const messages = doc.querySelectorAll('[data-testid="stChatMessage"]');
+        if (!messages.length) return;
+        const latest = messages[messages.length - 1];
+        const scroll = () => latest.scrollIntoView({behavior: 'smooth', block: 'start'});
+        window.setTimeout(scroll, 120);
+      } catch (e) { /* No scroll if iframe access is restricted. */ }
+    })();
+    </script>""", height=0)
+
+
 def contextual_search_query(question, history):
     """Keep topic and geography for short follow-ups without another AI request."""
     previous = next((m.get("content", "") for m in reversed(history)
@@ -1401,6 +1422,7 @@ def ny_samtale():
     st.session_state.session_id = uuid.uuid4().hex[:8]
     st.session_state.pop("pending_q", None)
     st.session_state.pop("last_search_topic", None)
+    st.session_state.pop("scroll_to_new_answer", None)
 
 
 st.markdown("""<style>
@@ -1444,6 +1466,11 @@ for i, message in enumerate(st.session_state.messages):
             st.markdown(message["content"])
         else:
             render_assistant(message, i, last=(i == len(st.session_state.messages) - 1))
+
+# Only auto-scroll after a newly generated answer, not on every interaction
+# (e.g. when opening sources or giving feedback).
+if st.session_state.pop("scroll_to_new_answer", False):
+    scroll_to_latest_answer()
 
 written = st.chat_input("Still et spørsmål eller et oppfølgingsspørsmål …", max_chars=1200)
 question = written or example_clicked or st.session_state.pop("pending_q", None)
@@ -1549,5 +1576,6 @@ if question and question.strip():
         # Vurdering vises foerst etter omlastingen under (unngaar dobbel widget).
         st.markdown(answer)
     st.session_state.messages.append(message)
+    st.session_state["scroll_to_new_answer"] = True
     # Ny kjoering slik at eksempelknappene forsvinner og «Ny samtale» vises.
     st.rerun()
