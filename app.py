@@ -607,60 +607,45 @@ def information_types():
 
 def filter_and_sort_documents(docs, malgruppe="Alle", omrade="Hele Bergen",
                               informasjonstype="Alle", sortering="Mest relevant"):
-    """Filtrer lagrede kandidater uten API-kall. Behold kommuneomfattende tilbud."""
-    def normal(t):
-        return str(t or "").casefold()
+    """Rask lokal filtrering av lagrede kandidater; ingen database- eller AI-kall.
 
-    def score(d):
-        score_ = 0
-        if malgruppe != "Alle":
-            group_text = normal(d.get("malgruppe"))
-            # Bruk bare malgruppe som sterk indikator; fritekst er ikke standardisert.
-            if any(word in group_text for word in MALGRUPPE_ORD[malgruppe]):
-                score_ += 5
-            elif any(word in normal(d.get("tittel")) for word in MALGRUPPE_ORD[malgruppe]):
-                score_ += 2
-        if omrade != "Hele Bergen":
-            bydel = normal(d.get("bydeler"))
-            geo = normal(d.get("geografi"))
-            title = normal(d.get("tittel"))
-            scope = normal(d.get("bydel_omfang"))
-            if normal(omrade) in [x.strip() for x in bydel.split(";")]:
-                score_ += 8
-            elif normal(omrade) in title or normal(omrade) in geo:
-                score_ += 5
-            elif scope == "hele kommunen":
-                score_ += 2  # svak indikator; 05b kan ha brukt antall bydelstreff
-        return score_
+    Informasjonstype er et eksakt filter. Målgruppe og område prioriteres,
+    slik at generelle/kommuneomfattende tilbud ikke forsvinner ved nulltreff.
+    """
+    def normal(value):
+        return str(value or "").casefold().strip()
 
     selected = [d for d in docs if informasjonstype == "Alle" or
                 normal(d.get("informasjonstype")) == normal(informasjonstype)]
-    if omrade != "Hele Bergen":
-        sted = normal(omrade)
-        def relevant_omrade(d):
-            bydeler = normal(d.get("bydeler"))
-            geo = normal(d.get("geografi"))
-            scope = normal(d.get("bydel_omfang"))
+
+    def relevance(d):
+        points = 0
+        if malgruppe != "Alle":
+            terms = MALGRUPPE_ORD.get(malgruppe, ())
+            target = normal(d.get("malgruppe"))
             title = normal(d.get("tittel"))
-            # Eksplisitt bydel eller kommuneomfattende tilbud; ukjent geografisk
-            # dekning inkluderes ikke automatisk som lokalt tilbud.
-            return (sted in [x.strip() for x in re.split(r"[;,|]", bydeler)]
-                    or sted in geo or sted in title
-                    or scope in ("hele kommunen", "hele bergen", "alle bydeler"))
-        selected = [d for d in selected if relevant_omrade(d)]
-    if malgruppe != "Alle":
-        ordliste = MALGRUPPE_ORD[malgruppe]
-        selected = [d for d in selected if
-                    any(w in normal(d.get("malgruppe")) or w in normal(d.get("tittel"))
-                        for w in ordliste)
-                    or normal(d.get("malgruppe")) in ("", "alle", "alle aldersgrupper")]
-    # Stabil sortering: behold den opprinnelige FTS/vektor-rangeringen ved lik score.
-    selected.sort(key=score, reverse=True)
+            if any(term in target for term in terms):
+                points += 10
+            elif any(term in title for term in terms):
+                points += 4
+        if omrade != "Hele Bergen":
+            place = normal(omrade)
+            bydeler = [x.strip() for x in re.split(r"[;,|]", normal(d.get("bydeler")))]
+            geo = normal(d.get("geografi"))
+            title = normal(d.get("tittel"))
+            scope = normal(d.get("bydel_omfang"))
+            if place in bydeler or place in geo or place in title:
+                points += 15
+            elif scope in ("hele kommunen", "hele bergen", "alle bydeler"):
+                points += 3
+        return points
+
+    # Python-sortering er stabil: ved lik prioritet beholdes opprinnelig søkerangering.
+    selected.sort(key=relevance, reverse=True)
     if sortering == "Nyeste først":
-        # Dato bare innenfor soketreffene. Manglende/ugyldig dato sist.
         def date_key(d):
-            v = str(d.get("dokumentdato") or "")
-            return v[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v[:10]) else ""
+            value = str(d.get("dokumentdato") or "")[:10]
+            return value if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else ""
         selected.sort(key=date_key, reverse=True)
     return selected
 
@@ -1304,36 +1289,40 @@ def render_documents(docs, key, start=1):
 
 
 def render_assistant(message, idx, show_feedback=True, last=False):
-    # Hvert svar tilhoerer filtrene som gjaldt da spoersmaalet ble sendt.
+    # AI-svaret er historisk og endres ikke ved filtervalg. Bare dokumentlisten
+    # nedenfor oppdateres fra allerede lagrede kandidater.
     saved_filters = message.get("filters") or {}
-    current_filters = aktive_filtre() if "aktive_filtre" in globals() else saved_filters
+    current_filters = aktive_filtre() if last else saved_filters
     changed_filters = last and bool(saved_filters) and any(
         saved_filters.get(k) != current_filters.get(k)
         for k in ("målgruppe", "område", "informasjonstype", "sortering")
     )
-    if changed_filters:
-        labels = [str(current_filters[k]) for k in ("målgruppe", "område", "informasjonstype")
-                  if current_filters.get(k) not in (None, "Alle", "Hele Bergen")]
-        valgt = " og ".join(labels) if labels else "Hele Bergen"
-        st.info(f"Du har valgt {valgt}. Trykk «Søk og få svar» for å se oppdaterte tilbud.")
-        return
     if saved_filters:
         labels = [str(saved_filters.get(k)) for k in ("målgruppe", "område", "informasjonstype")
                   if saved_filters.get(k) not in (None, "Alle", "Hele Bergen")]
-        st.caption("Dette svaret gjelder: " + (" · ".join(labels) if labels else "Hele Bergen · Alle målgrupper og typer"))
+        st.caption("AI-svaret ble laget for: " +
+                   (" · ".join(labels) if labels else "Hele Bergen · Alle målgrupper og typer"))
+    if changed_filters:
+        st.info("Filtrene er endret. Dokumentlisten nedenfor er oppdatert uten nytt søk eller AI-kall. "
+                "AI-svaret over listen er fortsatt basert på de opprinnelige filtrene. "
+                "Trykk «Søk og få svar» for et nytt AI-svar med de valgte filtrene.")
     if message.get("note"):
         st.caption("✏️ " + message["note"])
-    # Vis bare tall som er enkle aa forstaa. Resultatlisten er begrenset
-    # til de kandidatene som ble hentet ved dette soeket.
+    # Antall kandidater er ikke det samme som totalt antall FTS-treff.
     if message.get("count_context") is not None:
-        shown = len(message.get("display_docs") or [])
+        raw = message.get("raw_docs") or []
+        shown = len(filter_and_sort_documents(
+            raw, current_filters.get("målgruppe", "Alle"),
+            current_filters.get("område", "Hele Bergen"),
+            current_filters.get("informasjonstype", "Alle"),
+            current_filters.get("sortering", "Mest relevant")))
         total = message.get("all_total", message.get("actual_total", 0))
-        st.markdown(f"**{shown} dokumenter passer filtrene · {total:,} treff i søket totalt**".replace(",", " "))
+        st.markdown(f"**{shown} dokumenter i resultatlisten · {total:,} treff i søket totalt**".replace(",", " "))
         with st.expander("Hva betyr treffantallene?"):
-            st.write("Treffene er dokumenter fra kommunen, ikke antall ulike tilbud. "
-                     "Resultatlisten viser dokumenter som passer filtrene dine, "
-                     "blant de inntil 300 dokumentene som ble hentet fra søket. "
-                     "Det totale tallet gjelder søket før filtrene ble brukt.")
+            st.write("Resultatlisten bygger på inntil 300 lagrede søkekandidater. "
+                     "Målgruppe og område prioriterer relevante dokumenter, men skjuler ikke "
+                     "andre dokumenter automatisk. Informasjonstype avgrenser listen. "
+                     "Totaltallet gjelder det opprinnelige søket, før filtre.")
     st.markdown(message.get("content") or "Ingen svar.")
     # Vagt spoersmaal: knapper for aa avgrense (som «Avgrens søket» paa kommunens nettside)
     if message.get("choices") and last:
@@ -1347,7 +1336,7 @@ def render_assistant(message, idx, show_feedback=True, last=False):
     # fra lagrede kandidater, uten nytt databasesok eller Groq-kall.
     docs = message.get("sources") or []
     if docs:
-        if message.get("filters"):
+        if message.get("filters") and not changed_filters:
             f = message["filters"]
             aktive_etiketter = [
                 str(f[k]) for k in ("målgruppe", "område", "informasjonstype")
@@ -1363,16 +1352,23 @@ def render_assistant(message, idx, show_feedback=True, last=False):
             st.caption("Tallene [1], [2] osv. i svaret viser til disse kildene.")
             render_documents(docs, f"{mid}_sources", 1)
 
-    # Vis flere dokumenter fra samme soek, uten nye API-kall.
+    # Filtrering og paginering gjøres kun i minnet, uten Groq eller nytt søk.
     if message.get("raw_docs") is not None:
-        candidates = message.get("display_docs") or []
+        raw = message.get("raw_docs") or []
+        candidates = filter_and_sort_documents(
+            raw, current_filters.get("målgruppe", "Alle"),
+            current_filters.get("område", "Hele Bergen"),
+            current_filters.get("informasjonstype", "Alle"),
+            current_filters.get("sortering", "Mest relevant"))
+        mid = str(message.get("id") or idx)
         if candidates:
             with st.expander(f"🔎 Se flere treff ({len(candidates)})", expanded=False):
-                st.caption("De mest relevante dokumentene vises først. Velg Neste for å se flere.")
+                st.caption("Viser inntil 300 dokumenter fra det opprinnelige søket. "
+                           "Målgruppe og område prioriteres; informasjonstype filtreres.")
                 render_documents(candidates, f"{mid}_candidates", 1)
         else:
-            st.info("Ingen dokumenter i resultatlisten passer filtrene. "
-                    "Prøv et annet område eller et nytt spørsmål.")
+            st.info("Ingen av de lagrede dokumentene har denne informasjonstypen. "
+                    "Velg «Alle» eller still et nytt spørsmål.")
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1410,23 +1406,12 @@ def aktive_filtre():
 
 
 def oppdater_siste_svar():
-    """Kjor det siste sporsmalet automatisk med nye filtre.
-
-    Callbacken kjoeres foer widgetene tegnes, slik at et tidligere AI-svar
-    aldri fremstilles som et svar med nye filtre.
-    """
+    """Oppdater bare den lokale visningen. Ikke start nytt søk eller Groq-kall."""
     messages = st.session_state.get("messages", [])
-    last_question = next((m.get("content", "") for m in reversed(messages)
-                          if m.get("role") == "user"), "")
-    if last_question.strip():
-        st.session_state["pending_q"] = last_question
-        st.session_state["sporsmal_input"] = last_question
-        # Fjern det gamle sporsmalet/svaret fra den synlige samtalen.
-        # Et nytt par legges til av den vanlige soekeflyten nedenfor.
-        if messages and messages[-1].get("role") == "assistant":
-            messages.pop()
-        if messages and messages[-1].get("role") == "user":
-            messages.pop()
+    if messages and messages[-1].get("role") == "assistant":
+        mid = messages[-1].get("id")
+        if mid:
+            st.session_state[f"page_{mid}_candidates"] = 1
 
 
 def nullstill_filtre():
@@ -1441,7 +1426,11 @@ def ny_samtale():
     # Widget-verdier maa nullstilles i callback foer widgetene opprettes.
     st.session_state.messages = []
     st.session_state.session_id = uuid.uuid4().hex[:8]
-    nullstill_filtre()
+    # Nullstill direkte, uten å oppdatere et gammelt svar.
+    st.session_state["filter_malgruppe"] = "Alle"
+    st.session_state["filter_omrade"] = "Hele Bergen"
+    st.session_state["filter_type"] = "Alle"
+    st.session_state["filter_sortering"] = "Mest relevant"
     st.session_state.pop("refresh_last", None)
     st.session_state["sporsmal_input"] = ""
     st.session_state.pop("pending_q", None)
