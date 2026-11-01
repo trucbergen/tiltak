@@ -88,15 +88,15 @@ section[data-testid="stSidebar"] hr {margin: .35rem 0 !important;}
 /* Noytrale handlingsknapper: mindre dominerende enn rod primarfarge. */
 section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"],
 section[data-testid="stSidebar"] button[kind="secondary"] {
-  border-color: #b6c0cb;
-  background: #e2e6eb;
+  border-color: #a3adba;
+  background: #cbd1d8;
   color: #263445;
   font-weight: 600;
 }
 section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"]:hover,
 section[data-testid="stSidebar"] button[kind="secondary"]:hover {
   border-color: #8795a5;
-  background: #d3d9e0;
+  background: #b9c2cc;
   color: #172638;
 }
 .block-container {max-width: 1150px; padding-top: 1.5rem; padding-bottom: 4rem;}
@@ -291,7 +291,7 @@ def _like_any_case(field, word):
 
 
 def search_documents(question):
-    """FTS5: presist sok for korte spoersmaal, bredt OR-sok for flertema.
+    """FTS5: presist sok forst, deretter minst to sentrale soketermer.
 
     - Ord med minst PREFIX_MIN bokstaver soekes som prefiks (boeyning/sammensetning).
     - Bydeler er valgfrie og gir ekstra vekt (PLACE_BONUS).
@@ -304,6 +304,96 @@ def search_documents(question):
     if not all_words:
         return [], 0, "INGEN", None
 
+    # Ord som beskriver selve sporsmalet er viktigere enn generelle uttrykk.
+    generic = {
+        "bergen", "bergens", "dokument", "dokumenter", "dokumentasjon",
+        "informasjon", "opplysninger", "kommunale", "kommunal", "eksempel",
+        "eksempler", "sammenlign", "forklar", "sporsmal", "spørsmål",
+        "oppgi", "kilder", "kilde", "aktuelle", "mulige", "spesifikke",
+    }
+    places = [w for w in all_words if w in PLACE_NAMES]
+    words = [w for w in all_words if w not in PLACE_NAMES and w not in {"bergen", "bergens"}]
+    if not words:  # bare stedsnavn (eller «Bergen»): soek paa dem
+        words, places = all_words, []
+    important = [w for w in words if w not in generic and not w.isdigit()]
+    if not important:
+        important = [w for w in words if w not in generic] or words
+
+    # Lengre fagord har ofte stor verdi, men behold ogsa noen korte ord.
+    core = sorted(important, key=lambda w: (-len(w), words.index(w)))[:6]
+
+    def quote_word(w):
+        star = "*" if len(w) >= PREFIX_MIN else ""
+        return '"' + w.replace('"', '') + '"' + star
+
+    # Soketrinn: alle ord, de viktigste tre, sa minst to av de fem viktigste.
+    queries = [("AND", " AND ".join(map(quote_word, words)))]
+    if len(core) >= 3:
+        queries.append(("KJERNE", " AND ".join(map(quote_word, core[:3]))))
+    if len(core) >= 2:
+        pairs = list(combinations(core[:5], 2))
+        pair_query = " OR ".join(
+            "(" + quote_word(x) + " AND " + quote_word(y) + ")"
+            for x, y in pairs
+        )
+        queries.append(("MINST_2", pair_query))
+        # Siste trinn: minst ETT av ordene (f.eks. «fritidsklubb Loddefjord» der ingen side
+        # har begge ordene). BM25 rangerer sider med flest og sjeldnest ord oeverst.
+        if len(core) <= 3:
+            queries.append(("MINST_1", " OR ".join(map(quote_word, core[:5]))))
+    elif len(core) == 1:
+        queries.append(("ETT_FAGORD", quote_word(core[0])))
+
+    # FTS5 bm25: lavere verdi er bedre. Tittel, tema og malgruppe
+    # prioriteres, men selve dokumentteksten teller fortsatt.
+    bm25 = "bm25(documents_fts_full, 8.0, 1.0, 5.0, 3.0, 2.0, 4.0, 2.0, 2.0)"
+    bonus_parts, bonus_params = [], []
+    # Full vekt for forste soekeord som treffer feltet, litt mer per ekstra ord.
+    for field, first, extra in (("d.tittel", 6, 2), ("d.tema", 4, 1), ("d.malgruppe", 3, 1)):
+        cases, params = [], []
+        for word in core[:5]:
+            cond, prm = _like_any_case(field, word)
+            cases.append(f"(CASE WHEN {cond} THEN 1 ELSE 0 END)")
+            params += prm
+        if cases:
+            n = "(" + " + ".join(cases) + ")"
+            bonus_parts.append(f"({first} * min({n}, 1) + {extra} * max({n} - 1, 0))")
+            bonus_params += params + params
+    for place in places:
+        conds, prm = [], []
+        for field in ("d.tittel", "d.oppsummering", "d.malgruppe", "d.tekstutdrag"):
+            c, p = _like_any_case(field, place)
+            conds.append(c)
+            prm += p
+        bonus_parts.append(f"(CASE WHEN {' OR '.join(conds)} THEN {PLACE_BONUS} ELSE 0 END)")
+        bonus_params += prm
+    bonus_parts.append(f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)")
+    bonus_sql = " + ".join(bonus_parts) or "0"
+
+    extras = ",".join(f"d.{c}" for c in document_filter_fields())
+    extras = ("," + extras) if extras else ""
+    sql = f"""SELECT d.doc_id,d.tittel,d.url,d.oppsummering,d.tekstutdrag,
+                      d.tema,d.malgruppe,d.informasjonstype,d.kommune,d.dokumentdato{extras},
+                      {bm25} AS score
+               FROM documents_fts_full
+               JOIN documents d ON d.rowid=documents_fts_full.rowid
+               WHERE documents_fts_full MATCH ?
+               ORDER BY ({bm25} - ({bonus_sql})),d.doc_id LIMIT ?"""
+
+    with connect() as con:
+        con.row_factory = sqlite3.Row
+        for mode, expr in queries:
+            total = con.execute(
+                "SELECT COUNT(*) FROM documents_fts_full WHERE documents_fts_full MATCH ?",
+                (expr,),
+            ).fetchone()[0]
+            if total == 0:
+                continue
+            rows = con.execute(
+                sql, (expr, *bonus_params, MAX_LIST_RESULTS)
+            ).fetchall()
+            return [dict(row) for row in rows], total, mode, expr
+    return [], 0, "INGEN", None
 
 # ---------------------------------------------------------------------------
 # Semantisk sok
@@ -1299,11 +1389,6 @@ def nullstill_filtre():
 
 with st.sidebar:
     st.title("🔎 Finn tilbud")
-    # Hold ny samtale synlig over filtrene og det store sporsmalsfeltet.
-    if st.button("＋ Ny samtale", use_container_width=True, type="secondary"):
-        st.session_state.messages = []
-        st.session_state.pop("refresh_last", None)
-        st.rerun()
     st.caption("Velg filtre én gang. De gjelder også neste spørsmål.")
     st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
     st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
@@ -1312,8 +1397,12 @@ with st.sidebar:
     st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
     st.divider()
     with st.form("sporsmal_form", clear_on_submit=True):
-        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=145)
+        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
+    if st.button("＋ Ny samtale", use_container_width=True, type="secondary"):
+        st.session_state.messages = []
+        st.session_state.pop("refresh_last", None)
+        st.rerun()
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
 
 valgte = aktive_filtre()
