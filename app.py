@@ -1304,6 +1304,20 @@ def render_documents(docs, key, start=1):
 
 
 def render_assistant(message, idx, show_feedback=True, last=False):
+    # Hvert svar tilhoerer filtrene som gjaldt da spoersmaalet ble sendt.
+    saved_filters = message.get("filters") or {}
+    current_filters = aktive_filtre() if "aktive_filtre" in globals() else saved_filters
+    changed_filters = last and bool(saved_filters) and any(
+        saved_filters.get(k) != current_filters.get(k)
+        for k in ("målgruppe", "område", "informasjonstype", "sortering")
+    )
+    if changed_filters:
+        st.info("Du har endret filtrene. Svaret nedenfor gjelder det forrige søket. "
+                "Skriv spørsmålet på nytt og trykk «Søk og få svar» for å se resultater med de nye filtrene.")
+    if saved_filters:
+        labels = [str(saved_filters.get(k)) for k in ("målgruppe", "område", "informasjonstype")
+                  if saved_filters.get(k) not in (None, "Alle", "Hele Bergen")]
+        st.caption("Dette svaret gjelder: " + (" · ".join(labels) if labels else "Hele Bergen · Alle målgrupper og typer"))
     if message.get("note"):
         st.caption("✏️ " + message["note"])
     # Vis bare tall som er enkle aa forstaa. Resultatlisten er begrenset
@@ -1342,7 +1356,7 @@ def render_assistant(message, idx, show_feedback=True, last=False):
         mid = str(message.get("id") or idx)
         # Etter filterendring vises opprinnelige AI-kilder fortsatt separat,
         # mens den filtrerte kandidatlisten ligger nedenfor.
-        with st.expander("📄 Kilder til svaret"):
+        with st.expander(f"📄 Kilder til svaret ({len(set(int(n) for n in re.findall(r'\[(\d+)\]', message.get('content') or '') if 1 <= int(n) <= len(docs)))})"):
             st.caption("Tallene [1], [2] osv. i svaret viser til disse kildene.")
             render_documents(docs, f"{mid}_sources", 1)
 
@@ -1415,7 +1429,7 @@ def ny_samtale():
 with st.sidebar:
     st.title("🔎 Finn tilbud")
     st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
-    st.caption("Velg det du er interessert i, og trykk Søk og få svar.")
+    st.caption("Velg filtre, skriv et spørsmål og trykk Søk og få svar. Endrer du filtrene, må du søke på nytt.")
     st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe")
     st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade")
     st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type")
