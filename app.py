@@ -1317,6 +1317,16 @@ def render_assistant(message, idx, show_feedback=True, last=False):
                 render_documents(andre, f"{mid}_b", len(aktuelt) + 1)
                 if not andre:
                     st.caption("Ingen andre treff.")
+    if "filtered_docs" in message:
+        filtered = message["filtered_docs"]
+        st.info("Filtrene endrer bare dokumenttreffene nedenfor. AI-svaret over er fra det opprinnelige spørsmålet og er ikke generert på nytt.")
+        st.caption(f"Dokumenttreff med aktive filtre: {message.get('filtered_total', len(filtered))}")
+        with st.expander(f"🔎 Filtrerte dokumenttreff ({len(filtered)} vist)", expanded=True):
+            if filtered:
+                # Bruk separat kildevisning, uten å endre siteringsnumrene i AI-svaret.
+                render_documents(filtered, f"{message.get('id') or idx}_filter", 1)
+            else:
+                st.caption("Ingen dokumenttreff passer filtrene innenfor det opprinnelige søket. Prøv å nullstille filtrene eller still et nytt spørsmål.")
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1392,49 +1402,23 @@ valgt_sortering = valgte["sortering"]
 
 st.markdown('<div class="hero"><h1>Kommunal dokumentassistent</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
 
-# Filtrering av forrige sporsmal gjenbruker dokumentene fra soket.
-# Ren sortering gjenbruker ogsa AI-svaret; kilder som er sitert beholdes pa plass.
+# Filterendringer skal ALDRI kalle Groq eller kjore nytt databasesok.
+# Det opprinnelige AI-svaret og kildenumrene er uforandret.
+# Bare dokumenttreffene oppdateres fra raw_docs i sesjonsminnet.
 if st.session_state.pop("refresh_last", False) and st.session_state.messages:
     last = st.session_state.messages[-1]
     if last.get("role") == "assistant" and last.get("raw_docs") is not None:
-        previous = last.get("filters", {})
-        changed = any(previous.get(k) != valgte[k] for k in ("målgruppe", "område", "informasjonstype"))
-        if changed:
-            with st.spinner("Oppdaterer svaret med de nye filtrene ..."):
-                docs = filter_and_sort_documents(last["raw_docs"], valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
-                if valgt_sortering == "Mest relevant":
-                    docs = diversify(docs)
-                if not docs:
-                    last["content"] = "Ingen dokumenter passer de valgte filtrene. Prøv et annet filter."
-                    last["sources"] = []
-                else:
-                    try:
-                        prompt = (last["query_corrected"] + f"\nValgte søkefiltre: målgruppe={valgt_malgruppe}; område={valgt_omrade}; informasjonstype={valgt_type}. Ikke anta fysisk plassering uten kildestøtte.")
-                        history = st.session_state.messages[:-2]
-                        answer, _ = generate(prompt, docs[:AI_SOURCES], history)
-                        answer = normalize_markdown(answer)
-                        if "INGEN_TREFF" in answer[:200]:
-                            last["content"] = re.sub(r"(?is)\W*INGEN_TREFF\s*:\s*", "", answer, count=1).strip()
-                            last["sources"] = []
-                        else:
-                            last["content"], numbered = renumber_sources(answer, docs)
-                            last["sources"] = numbered[:SOURCES_MAX]
-                    except Exception as exc:
-                        st.warning("Kunne ikke oppdatere AI-svaret. Det forrige svaret er beholdt.")
-                        print(f"[filter] {type(exc).__name__}: {exc}", file=sys.stderr)
-                        last["filters"] = previous
-                        docs = None
-                if docs is not None:
-                    last["total"] = len(docs)
-                    last["filters"] = dict(valgte)
-                    last["choices"] = []
-        else:
-            # Behold siterte kilder forst, slik at [1], [2] osv. fortsatt stemmer.
-            used = [d for d in last.get("sources", []) if d.get("_brukt")]
-            rest = [d for d in last.get("sources", []) if not d.get("_brukt")]
-            rest = filter_and_sort_documents(rest, sortering=valgt_sortering)
-            last["sources"] = used + rest
-            last["filters"] = dict(valgte)
+        docs = filter_and_sort_documents(
+            [dict(d) for d in last["raw_docs"]],
+            valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering,
+        )
+        if valgt_sortering == "Mest relevant":
+            docs = diversify(docs)
+        # De opprinnelige AI-kildene bevares, selv om de ikke matcher et nytt filter.
+        # De vises separat, slik at [1], [2] osv. fortsatt er korrekte.
+        last["filtered_docs"] = docs[:SOURCES_MAX]
+        last["filtered_total"] = len(docs)
+        last["filters"] = dict(valgte)
 
 example_clicked = None
 if not st.session_state.messages:
