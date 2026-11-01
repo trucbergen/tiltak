@@ -1414,6 +1414,11 @@ def scroll_to_latest_answer():
           if (!question) return;
           lastUser = question;
           const scroller = findScroller(question);
+          // Without space below a short final answer, the browser cannot scroll
+          // far enough to put its question at the top of the viewport.
+          const main = question.closest('[data-testid="stMainBlockContainer"]') ||
+                       question.closest('.block-container');
+          if (main) main.style.paddingBottom = 'max(75vh, 620px)';
           const rect = question.getBoundingClientRect();
           const containerRect = scroller.getBoundingClientRect();
           const isDocument = scroller === doc.scrollingElement || scroller === doc.documentElement;
@@ -1441,18 +1446,37 @@ def scroll_to_latest_answer():
     </script>""", height=0)
 
 
+def is_context_followup(question, history):
+    """Detect references to earlier offers, without treating a new topic as a follow-up."""
+    if not any(m.get("role") == "assistant" for m in history):
+        return False
+    q = question.casefold().strip()
+    new_topic = ("noe annet", "helt annet", "nytt tema", "bytte tema", "skifte tema")
+    if any(term in q for term in new_topic):
+        return False
+    references = ("disse", "dem", "de tilbudene", "de aktivitetene", "av dem",
+                  "hvilke av", "hva med dem", "deres", "nevnte", "ovenfor")
+    return any(term in q for term in references) or len(words_from_question(question)) <= 3
+
+
 def contextual_search_query(question, history):
-    """Keep topic and geography for short follow-ups without another AI request."""
+    """Use previous user question for short follow-ups; do not concatenate recursively."""
+    if not is_context_followup(question, history):
+        return question
     previous = next((m.get("content", "") for m in reversed(history)
                      if m.get("role") == "user"), "")
-    if not previous:
-        return question
-    q = question.casefold()
-    followup_words = ("disse", "dette", "dem", "de tilbudene", "av dem", "der", "gratis",
-                      "påmelding", "melde meg", "hva koster", "hvilke av", "når er")
-    if len(words_from_question(question)) <= 3 or any(w in q for w in followup_words):
-        return previous + " " + question
-    return question
+    return (previous[:400] + " " + question) if previous else question
+
+
+def previous_answer_sources(history):
+    """Only offers actually cited in the last answer may be discussed as 'these'."""
+    previous = next((m for m in reversed(history) if m.get("role") == "assistant"), None)
+    if not previous or str(previous.get("content", "")).startswith("AI-tjenesten"):
+        return []
+    docs = previous.get("sources") or []
+    allowed = set(previous.get("ai_input_ids") or [])
+    return [dict(d) for d in docs if d.get("doc_id") is not None
+            and (not allowed or d.get("doc_id") in allowed)][:AI_SOURCES]
 
 if not DB_PATH.is_file():
     st.error("Dokumentdatabasen er ikke tilgjengelig. Kontakt den som drifter tjenesten.")
@@ -1529,9 +1553,8 @@ if question and question.strip():
     question = question.strip()[:1200]
     asked = question                                   # det brukeren skrev (vises i chatten)
     history = list(st.session_state.messages)
-    previous_topic = st.session_state.get("last_search_topic", "")
-    search_history = ([{"role": "user", "content": previous_topic}] if previous_topic else history)
-    search_question = contextual_search_query(question, search_history)
+    followup = is_context_followup(question, history)
+    search_question = contextual_search_query(question, history)
     st.session_state["last_search_topic"] = search_question[:500]
     search_question, spell_fixes = correct_spelling(search_question)
     question = question  # original question is retained for chat display
@@ -1541,12 +1564,24 @@ if question and question.strip():
     with st.chat_message("assistant"):
         try:
             with st.spinner("Søker i dokumentene ..."):
-                docs, total, _mode, _note, count_context = run_search(search_question, SEARCH_METHOD)
-                actual_total = count_full_search_matches(count_context)
-                all_total = count_full_search_matches(count_context)
-                raw_docs = [dict(d) for d in docs]
-                total = actual_total
-                docs = diversify(docs)
+                # For references like "these", keep the exact documents used in the
+                # previous answer. A broad FTS search for "registration" alone would
+                # otherwise introduce unrelated events and lose the referent.
+                anchored_docs = previous_answer_sources(history) if followup else []
+                if anchored_docs:
+                    docs = anchored_docs
+                    total = len(docs)
+                    count_context = {"fts_expr": None, "semantic_ids": []}
+                    actual_total = total
+                    all_total = total
+                    raw_docs = [dict(d) for d in docs]
+                else:
+                    docs, total, _mode, _note, count_context = run_search(search_question, SEARCH_METHOD)
+                    actual_total = count_full_search_matches(count_context)
+                    all_total = actual_total
+                    raw_docs = [dict(d) for d in docs]
+                    total = actual_total
+                    docs = diversify(docs)
         except sqlite3.Error:
             st.error("Søket feilet. Prøv igjen.")
             st.stop()
@@ -1568,10 +1603,14 @@ if question and question.strip():
             with st.spinner("Lager svar ..."):
                 try:
                     # Follow-ups use earlier topic in retrieval and current wording in the answer.
-                    answer_question = (f"Tidligere tema: {search_question}\n"
+                    answer_question = (f"Søketema: {search_question}\n"
                                        f"Brukerens siste spørsmål: {question}\n"
-                                       "Svar på det siste spørsmålet, med kildene nedenfor. "
-                                       "Ikke anta at et tilbud gjelder en bestemt bydel uten dokumentasjon.")
+                                       + ("Dette er et oppfølgingsspørsmål om tilbudene i forrige svar. "
+                                          "Vurder BARE disse tilbudene; IKKE introduser andre aktiviteter eller arrangementer. "
+                                          "Dersom påmelding, pris eller åpningstid ikke er dokumentert, si det tydelig. "
+                                          if anchored_docs else "")
+                                       + "Svar på siste spørsmål med de oppgitte kildene. "
+                                         "Ikke anta at et tilbud gjelder en bestemt bydel uten dokumentasjon.")
                     answer, _usage = generate(answer_question, docs[:AI_SOURCES], history)
                     answer = normalize_markdown(answer)
                     # Modellen fant ingenting relevant: vis ikke dokumentene (de er da urelaterte).
