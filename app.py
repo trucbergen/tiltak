@@ -1372,21 +1372,46 @@ def render_assistant(message, idx, show_feedback=True, last=False):
 
 
 def scroll_to_latest_answer():
-    """Scroll main page to the newest answer after a Streamlit rerun.
+    """Place the newest user question near the top of the visible Streamlit page.
 
-    Runs in a tiny Streamlit component. If the host disallows access to the
-    parent document, the rest of the app continues normally.
+    Only invoked after a newly completed answer, never for expander or sort changes.
     """
     components.html("""<script>
     (function () {
       try {
         const doc = window.parent.document;
-        const messages = doc.querySelectorAll('[data-testid="stChatMessage"]');
-        if (!messages.length) return;
-        const latest = messages[messages.length - 1];
-        const scroll = () => latest.scrollIntoView({behavior: 'smooth', block: 'start'});
-        window.setTimeout(scroll, 120);
-      } catch (e) { /* No scroll if iframe access is restricted. */ }
+        let attempts = 0;
+        function focusNewestQuestion() {
+          const messages = doc.querySelectorAll('[data-testid="stChatMessage"]');
+          const questions = Array.from(messages).filter(el =>
+            el.getAttribute('aria-label')?.toLowerCase().includes('user') ||
+            el.querySelector('[data-testid="stChatMessageAvatarUser"]')
+          );
+          // The last two chat messages are the new user question and AI answer.
+          // Prefer the user message identified by its avatar; use penultimate
+          // message as a fallback for Streamlit versions with different markup.
+          const target = questions.length ? questions[questions.length - 1]
+                                          : messages.length >= 2 ? messages[messages.length - 2] : null;
+          if (!target) {
+            if (++attempts < 15) window.setTimeout(focusNewestQuestion, 150);
+            return;
+          }
+          const scrollContainer = target.closest('[data-testid="stMain"]') ||
+                                  doc.querySelector('[data-testid="stAppViewContainer"]');
+          const topPadding = 20;
+          const rect = target.getBoundingClientRect();
+          const scroller = scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight
+                           ? scrollContainer : doc.scrollingElement;
+          if (scroller) {
+            const scrollerTop = scroller.getBoundingClientRect().top;
+            scroller.scrollTo({top: scroller.scrollTop + rect.top - scrollerTop - topPadding,
+                               behavior: 'instant'});
+          } else {
+            target.scrollIntoView({behavior: 'instant', block: 'start'});
+          }
+        }
+        window.setTimeout(focusNewestQuestion, 180);
+      } catch (e) { /* Ignore iframe permission or DOM differences. */ }
     })();
     </script>""", height=0)
 
