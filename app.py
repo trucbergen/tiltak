@@ -1372,23 +1372,26 @@ def render_assistant(message, idx, show_feedback=True, last=False):
 
 
 def scroll_to_latest_answer():
-    """Rull til siste brukersporsmal etter at Streamlit har tegnet chatten.
+    """Place the latest user question near the top after the answer is rendered.
 
-    Streamlit kan selv rulle til bunnen ved chat_input og ved rerun. Vi bruker
-    derfor flere korte, tidsavgrensede forsok mot riktig rullecontainer.
+    The browser may reposition the page after Streamlit reruns. Retry only for
+    this newly completed answer, and do not rerun when sources are expanded.
     """
-    components.html("""<script>
+    components.html(r"""<script>
     (function () {
       try {
-        const doc = window.parent.document;
+        const win = window.parent;
+        const doc = win.document;
         const started = Date.now();
-        let lastTop = null;
-        let stable = 0;
+        const duration = 5500;
+        let observer = null;
+        let timer = null;
+        let lastUser = null;
 
-        function findScrollParent(el) {
-          let node = el.parentElement;
+        function findScroller(element) {
+          let node = element.parentElement;
           while (node && node !== doc.body) {
-            const style = window.parent.getComputedStyle(node);
+            const style = win.getComputedStyle(node);
             if (/(auto|scroll)/.test(style.overflowY) &&
                 node.scrollHeight > node.clientHeight + 2) return node;
             node = node.parentElement;
@@ -1396,35 +1399,44 @@ def scroll_to_latest_answer():
           return doc.scrollingElement || doc.documentElement;
         }
 
-        function moveToNewest() {
+        function findLatestQuestion() {
           const messages = Array.from(doc.querySelectorAll('[data-testid="stChatMessage"]'));
           const users = messages.filter(el =>
             (el.getAttribute('aria-label') || '').toLowerCase().includes('user') ||
             !!el.querySelector('[data-testid="stChatMessageAvatarUser"]')
           );
-          const target = users.length ? users[users.length - 1] :
-                         messages.length >= 2 ? messages[messages.length - 2] : null;
-          if (!target) {
-            if (Date.now() - started < 2500) window.setTimeout(moveToNewest, 120);
-            return;
-          }
-          const scroller = findScrollParent(target);
-          const targetRect = target.getBoundingClientRect();
-          const scrollRect = scroller.getBoundingClientRect();
-          const desired = Math.max(0, scroller.scrollTop + targetRect.top - scrollRect.top - 16);
-          scroller.scrollTop = desired;
-
-          const currentTop = target.getBoundingClientRect().top;
-          if (lastTop !== null && Math.abs(currentTop - lastTop) < 3) stable++;
-          else stable = 0;
-          lastTop = currentTop;
-          // Gi Streamlit tid til a fullfore rerun og eventuell egen auto-scroll.
-          if (Date.now() - started < 2200 && (stable < 3 || Date.now() - started < 650)) {
-            window.setTimeout(moveToNewest, 130);
-          }
+          return users.length ? users[users.length - 1] :
+            (messages.length >= 2 ? messages[messages.length - 2] : null);
         }
-        window.setTimeout(moveToNewest, 100);
-      } catch (e) { /* Ulik Streamlit-versjon eller blokkert iframe. */ }
+
+        function alignQuestion() {
+          const question = findLatestQuestion();
+          if (!question) return;
+          lastUser = question;
+          const scroller = findScroller(question);
+          const rect = question.getBoundingClientRect();
+          const containerRect = scroller.getBoundingClientRect();
+          const isDocument = scroller === doc.scrollingElement || scroller === doc.documentElement;
+          const containerTop = isDocument ? 0 : containerRect.top;
+          // Leave a small margin above the newest question.
+          const desired = Math.max(0, scroller.scrollTop + rect.top - containerTop - 18);
+          scroller.scrollTop = desired;
+        }
+
+        // Streamlit can change scroll position after the HTML has been inserted.
+        // Re-align through the entire render window, including long AI answers.
+        function tick() {
+          alignQuestion();
+          if (Date.now() - started < duration) timer = win.setTimeout(tick, 180);
+          else if (observer) observer.disconnect();
+        }
+        timer = win.setTimeout(tick, 80);
+        // A mutation observer catches late DOM updates between timed attempts.
+        observer = new win.MutationObserver(() => {
+          if (Date.now() - started < duration) win.requestAnimationFrame(alignQuestion);
+        });
+        observer.observe(doc.body, {childList: true, subtree: true});
+      } catch (e) { /* Browser may block parent access. */ }
     })();
     </script>""", height=0)
 
