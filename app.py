@@ -74,8 +74,16 @@ GROQ_REASONING_EFFORT = "low"  # gpt-oss: low / medium / high
 STOPWORDS = set("skjer skjera hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
 st.markdown("""<style>
-.block-container {max-width: 1050px; padding-top: 1.5rem; padding-bottom: 4rem;}
-@media (max-width: 768px) {.block-container {padding-left: 1rem; padding-right: 1rem; padding-top: 1rem;} .hero h1 {font-size: 1.45rem;}}
+/* Bredere sidepanel paa PC, uten aa presse innholdet paa mobil. */
+section[data-testid="stSidebar"] {width: 380px !important; min-width: 380px !important;}
+section[data-testid="stSidebar"] > div {width: 380px !important;}
+.block-container {max-width: 1150px; padding-top: 1.5rem; padding-bottom: 4rem;}
+@media (max-width: 768px) {
+  section[data-testid="stSidebar"] {width: min(380px, 88vw) !important; min-width: 0 !important;}
+  section[data-testid="stSidebar"] > div {width: 100% !important;}
+  .block-container {padding-left: 1rem; padding-right: 1rem; padding-top: 1rem;}
+  .hero h1 {font-size: 1.45rem;}
+}
 .hero {padding: .6rem 0 .4rem;}
 .hero h1 {font-size: 2rem; letter-spacing: -.035em; margin: 0;}
 .hero p {color: #7a8595; margin-top: .55rem;}
@@ -1433,7 +1441,7 @@ with st.sidebar:
     st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
     st.divider()
     with st.form("sporsmal_form", clear_on_submit=True):
-        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=105)
+        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=220)
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="primary")
     if st.button("Ny samtale", use_container_width=True):
         st.session_state.messages = []
