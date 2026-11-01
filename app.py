@@ -22,7 +22,7 @@ from urllib.parse import quote
 
 import streamlit as st
 
-st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="centered")
+st.set_page_config(page_title="Kommunal dokumentassistent", page_icon="🔎", layout="wide", initial_sidebar_state="auto")
 # Databasen ligger i samme mappe som app.py (lokalt og i Streamlit Cloud).
 DB_PATH = Path(__file__).resolve().parent / "bergen_db.db"
 # Vektorfil fra 09_bergen_vektorer.R. Mangler den, brukes bare nokkelordsok.
@@ -56,9 +56,9 @@ SHORT_QUERY_MIN_FTS = 10    # kort spoersmaal + minst saa mange noekkelordtreff 
 SEARCH_METHOD = "Hybrid"
 GROQ_MODEL = "openai/gpt-oss-120b"  # Alternativ: "llama-3.3-70b-versatile"
 TRANSIENT_STATUS = ("408", "429", "500", "502", "503", "504")
-AI_SOURCES = 6
-SHOW_SOURCES = 10  # antall dokumenter som vises under «Kilder» foerst
-SOURCES_MAX = 50   # inntil saa mange dokumenter i kildelisten (Mest aktuelt + Andre treff)
+AI_SOURCES = 8
+SHOW_SOURCES = 5  # antall dokumenter som vises under «Kilder» foerst
+SOURCES_MAX = 30   # inntil saa mange dokumenter i kildelisten (Mest aktuelt + Andre treff)
 # Vage spoersmaal: mange treff spredt over mange deler av nettstedet -> be brukeren avgrense
 VAGUE_MIN_HITS = 100       # minst saa mange noekkelordtreff
 VAGUE_MAX_WORDS = 3        # og hoeyst saa mange innholdsord i spoersmaalet
@@ -74,7 +74,8 @@ GROQ_REASONING_EFFORT = "low"  # gpt-oss: low / medium / high
 STOPWORDS = set("skjer skjera hva hvilke hvilken hvilket hvordan hvor hvem hvorfor finnes fins har er det den de der som for til fra med om og eller i på av et en jeg vi kan man du dere meg oss blir bli kommunen kommune noen noe innen ved hos gjennom skal vil kunne være the a må ble finn her ei kommuner bydel bydelen bor trenger tilbyr tilbudet sine deres vår vårt".split())
 
 st.markdown("""<style>
-.block-container {max-width: 860px; padding-top: 2.2rem; padding-bottom: 5rem;}
+.block-container {max-width: 1050px; padding-top: 1.5rem; padding-bottom: 4rem;}
+@media (max-width: 768px) {.block-container {padding-left: 1rem; padding-right: 1rem; padding-top: 1rem;} .hero h1 {font-size: 1.45rem;}}
 .hero {padding: .6rem 0 .4rem;}
 .hero h1 {font-size: 2rem; letter-spacing: -.035em; margin: 0;}
 .hero p {color: #7a8595; margin-top: .55rem;}
@@ -1294,6 +1295,9 @@ def render_assistant(message, idx, show_feedback=True, last=False):
                     st.rerun()
     docs = message.get("sources") or []
     if docs:
+        if message.get("filters"):
+            f = message["filters"]
+            st.caption("Valgt: " + " · ".join(str(f.get(k)) for k in ("målgruppe", "område", "informasjonstype") if f.get(k) not in ("Alle", "Hele Bergen"))) if any(f.get(k) not in ("Alle", "Hele Bergen", None) for k in ("målgruppe", "område", "informasjonstype")) else None
         st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
         total = message.get("total", len(docs))
         mid = str(message.get("id") or idx)
@@ -1341,39 +1345,104 @@ if "messages" not in st.session_state:
 if "session_id" not in st.session_state:
     st.session_state.session_id = uuid.uuid4().hex[:8]
 
-head_left, head_right = st.columns([5, 1], vertical_alignment="center")
-with head_left:
-    st.markdown('<div class="hero"><h1>🔎 Kommunal dokumentassistent</h1><p>Spør om tjenester, '
-                'tiltak og dokumenter fra kommuner og offentlige kilder.</p></div>', unsafe_allow_html=True)
-with head_right:
-    if st.session_state.messages and st.button("Ny samtale", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
+# Sidepanelet fungerer pa PC og kollapser automatisk pa mobil.
+def aktive_filtre():
+    return {"målgruppe": st.session_state.get("filter_malgruppe", "Alle"),
+            "område": st.session_state.get("filter_omrade", "Hele Bergen"),
+            "informasjonstype": st.session_state.get("filter_type", "Alle"),
+            "sortering": st.session_state.get("filter_sortering", "Mest relevant")}
 
-# Valgfrie filtre. Standardvalgene gir samme sok som tidligere.
-st.markdown("#### Avgrens søket")
-f1, f2, f3 = st.columns(3)
-with f1:
-    valgt_malgruppe = st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe")
-with f2:
-    valgt_omrade = st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade")
-with f3:
-    valgt_type = st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type")
-valgt_sortering = st.radio("Sortering", ["Mest relevant", "Nyeste først"],
-                          horizontal=True, key="filter_sortering")
-st.caption("Målgruppe og område prioriterer treff. Informasjonstype avgrenser treffene. "
-           "'Nyeste først' sorterer relevante søketreff etter dato.")
+
+def oppdater_siste_svar():
+    # Filtrene gjelder neste sporsmal og oppdaterer siste svar uten ny brukermelding.
+    st.session_state["refresh_last"] = True
+
+
+def nullstill_filtre():
+    st.session_state["filter_malgruppe"] = "Alle"
+    st.session_state["filter_omrade"] = "Hele Bergen"
+    st.session_state["filter_type"] = "Alle"
+    st.session_state["filter_sortering"] = "Mest relevant"
+    oppdater_siste_svar()
+
+
+with st.sidebar:
+    st.title("🔎 Finn kommunale tilbud")
+    st.caption("Velg filtre én gang. De gjelder også neste spørsmål.")
+    st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
+    st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
+    st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type", on_change=oppdater_siste_svar)
+    st.radio("Sortering", ["Mest relevant", "Nyeste først"], key="filter_sortering", on_change=oppdater_siste_svar)
+    st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
+    st.divider()
+    with st.form("sporsmal_form", clear_on_submit=True):
+        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=105)
+        sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="primary")
+    if st.button("Ny samtale", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.pop("refresh_last", None)
+        st.rerun()
+    st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
+
+valgte = aktive_filtre()
+valgt_malgruppe = valgte["målgruppe"]
+valgt_omrade = valgte["område"]
+valgt_type = valgte["informasjonstype"]
+valgt_sortering = valgte["sortering"]
+
+st.markdown('<div class="hero"><h1>Kommunal dokumentassistent</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
+
+# Filtrering av forrige sporsmal gjenbruker dokumentene fra soket.
+# Ren sortering gjenbruker ogsa AI-svaret; kilder som er sitert beholdes pa plass.
+if st.session_state.pop("refresh_last", False) and st.session_state.messages:
+    last = st.session_state.messages[-1]
+    if last.get("role") == "assistant" and last.get("raw_docs") is not None:
+        previous = last.get("filters", {})
+        changed = any(previous.get(k) != valgte[k] for k in ("målgruppe", "område", "informasjonstype"))
+        if changed:
+            with st.spinner("Oppdaterer svaret med de nye filtrene ..."):
+                docs = filter_and_sort_documents(last["raw_docs"], valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
+                if valgt_sortering == "Mest relevant":
+                    docs = diversify(docs)
+                if not docs:
+                    last["content"] = "Ingen dokumenter passer de valgte filtrene. Prøv et annet filter."
+                    last["sources"] = []
+                else:
+                    try:
+                        prompt = (last["query_corrected"] + f"\nValgte søkefiltre: målgruppe={valgt_malgruppe}; område={valgt_omrade}; informasjonstype={valgt_type}. Ikke anta fysisk plassering uten kildestøtte.")
+                        history = st.session_state.messages[:-2]
+                        answer, _ = generate(prompt, docs[:AI_SOURCES], history)
+                        answer = normalize_markdown(answer)
+                        if "INGEN_TREFF" in answer[:200]:
+                            last["content"] = re.sub(r"(?is)\W*INGEN_TREFF\s*:\s*", "", answer, count=1).strip()
+                            last["sources"] = []
+                        else:
+                            last["content"], numbered = renumber_sources(answer, docs)
+                            last["sources"] = numbered[:SOURCES_MAX]
+                    except Exception as exc:
+                        st.warning("Kunne ikke oppdatere AI-svaret. Det forrige svaret er beholdt.")
+                        print(f"[filter] {type(exc).__name__}: {exc}", file=sys.stderr)
+                        last["filters"] = previous
+                        docs = None
+                if docs is not None:
+                    last["total"] = len(docs)
+                    last["filters"] = dict(valgte)
+                    last["choices"] = []
+        else:
+            # Behold siterte kilder forst, slik at [1], [2] osv. fortsatt stemmer.
+            used = [d for d in last.get("sources", []) if d.get("_brukt")]
+            rest = [d for d in last.get("sources", []) if not d.get("_brukt")]
+            rest = filter_and_sort_documents(rest, sortering=valgt_sortering)
+            last["sources"] = used + rest
+            last["filters"] = dict(valgte)
 
 example_clicked = None
 if not st.session_state.messages:
-    st.caption("Prøv for eksempel:")
+    st.caption("Eksempler på spørsmål:")
     for ex_col, example in zip(st.columns(len(EXAMPLE_QUESTIONS)), EXAMPLE_QUESTIONS):
         with ex_col:
             if st.button(example, use_container_width=True, key=f"ex_{example}"):
                 example_clicked = example
-    if logging_enabled():
-        st.caption("Spørsmål, svar og vurderinger lagres for å forbedre tjenesten. "
-                   "Ikke skriv inn personopplysninger.")
 
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
@@ -1382,8 +1451,7 @@ for i, message in enumerate(st.session_state.messages):
         else:
             render_assistant(message, i, last=(i == len(st.session_state.messages) - 1))
 
-question = (st.chat_input("Still et spørsmål om kommunale dokumenter ...") or example_clicked
-            or st.session_state.pop("pending_q", None))
+question = (skrevet if sendt else None) or example_clicked or st.session_state.pop("pending_q", None)
 if question and question.strip():
     question = question.strip()[:1200]
     asked = question                                   # det brukeren skrev (vises i chatten)
@@ -1396,6 +1464,7 @@ if question and question.strip():
         try:
             with st.spinner("Søker i dokumentene ..."):
                 docs, total, _mode, _note = run_search(question, SEARCH_METHOD)
+                raw_docs = [dict(d) for d in docs]
                 docs = filter_and_sort_documents(
                     docs, valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
                 total = len(docs) if valgt_type != "Alle" else total
@@ -1454,7 +1523,7 @@ if question and question.strip():
                    "choices": choices, "query": asked,
                    "filters": {"målgruppe": valgt_malgruppe, "område": valgt_omrade,
                                "informasjonstype": valgt_type, "sortering": valgt_sortering},
-                   "id": answer_id}
+                   "id": answer_id, "raw_docs": raw_docs, "query_corrected": question}
         top = docs[:AI_SOURCES]
         log_event("svar", [
             now_str(), answer_id, tester_id(), st.session_state.session_id, question, answer,
