@@ -735,6 +735,70 @@ def url_group(url):
     return "/".join(parts[:-1]) or "/"
 
 
+def rank_for_question(docs, question):
+    """Ranger kilder etter brukerens behov uten aa fjerne dokumenter.
+
+    Konkrete tjenestesider prioriteres ved tilbudsspoersmaal. Sted og
+    maalgruppe leses fra spoersmaalet, ikke fra ekstra brukerfiltre.
+    """
+    q = question.casefold()
+    places = {p for p in PLACE_NAMES if re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)", q)}
+    activity = bool(re.search(r"aktivitet|fritid|fritidsklubb|idrett|kulturtilbud|arrangement", q))
+    wants_offers = bool(re.search(r"hvilke|hvor|finnes|tilbud|tjenest|hjelp|aktivitet|kan jeg", q))
+    research = bool(re.search(r"rapport|forskning|statistikk|undersøk|budsjett|vedtak|politikk|planer", q))
+    groups = []
+    if re.search(r"barn|ungdom|unge|tenår|elev", q):
+        groups = ["barn", "unge", "ungdom", "tenår", "elev"]
+    elif re.search(r"eldre|senior|pensjonist", q):
+        groups = ["eldre", "senior", "pensjonist"]
+
+    def score(doc):
+        title = str(doc.get("tittel") or "").casefold()
+        summary = str(doc.get("oppsummering") or "").casefold()
+        target = str(doc.get("malgruppe") or "").casefold()
+        typ = str(doc.get("informasjonstype") or "").casefold()
+        district = str(doc.get("bydeler") or "").casefold()
+        geo = str(doc.get("geografi") or "").casefold()
+        scope = str(doc.get("bydel_omfang") or "").casefold()
+        url = str(doc.get("url") or "").casefold()
+        pts = 0
+        if groups:
+            if any(g in target for g in groups):
+                pts += 12
+            elif any(g in title for g in groups):
+                pts += 6
+            elif target and any(g in target for g in ("senior", "eldre")) and groups[0] == "barn":
+                pts -= 14
+        if places:
+            if any(re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)",
+                             " ".join((district, geo, title, url))) for p in places):
+                pts += 17
+            elif any(x in scope for x in ("hele kommunen", "hele bergen", "alle bydeler")):
+                pts += 4
+            elif district and not any(p in district for p in places):
+                pts -= 5  # Andre navngitte bydeler er mindre relevante
+        if wants_offers and not research:
+            if "/innbyggerhjelpen/" in url or page_type(url) == "Tjenester":
+                pts += 16
+            if any(x in typ for x in ("tjeneste", "aktivitet", "tilbud")):
+                pts += 8
+            if any(x in typ for x in ("rapport", "fagartikkel", "nyhet")):
+                pts -= 14
+            if page_type(url) in ("Politikk", "Nyheter og aktuelt"):
+                pts -= 12
+            if re.search(r"rapport|kartlegg|undersøk|budsjett|forskning|statistikk|strategi", title):
+                pts -= 13
+            if activity:
+                if re.search(r"fritidsaktivitet|aktivitetstilbud|fritidsklubb|idrettslag|kulturtilbud", title):
+                    pts += 10
+                if re.search(r"fritidsaktivitet|aktivitetstilbud|fritidsklubb", summary):
+                    pts += 3
+        return pts
+
+    # Stabil sortering: opprinnelig hybridrangering avgjoer ved lik score.
+    return sorted(docs, key=score, reverse=True)
+
+
 def diversify(docs, first_n=SHOW_SOURCES, max_per_group=MAX_PER_GROUP):
     """Samme dokumenter, ny rekkefoelge: de foerste first_n har hoeyst max_per_group per gruppe.
     Det som skyves ut, kommer rett etter (ingen dokumenter forsvinner)."""
@@ -1597,7 +1661,7 @@ if question and question.strip():
                     all_total = actual_total
                     raw_docs = [dict(d) for d in docs]
                     total = actual_total
-                    docs = diversify(docs)
+                    docs = diversify(rank_for_question(docs, search_question))
         except sqlite3.Error:
             st.error("Søket feilet. Prøv igjen.")
             st.stop()
