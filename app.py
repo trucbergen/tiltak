@@ -907,6 +907,23 @@ SYSTEM_PROMPT = (
     "Bruk bare kildenummer som finnes i dokumentgrunnlaget. "
     "Hver konkret opplysning skal kunne kontrolleres mot kilden. "
 
+    "PRIS OG BETALING: "
+    "Bruk ordet gratis KUN dersom kilden uttrykkelig bekrefter at det aktuelle "
+    "tilbudet er gratis eller kostnadsfritt. At pris ikke er nevnt, er ALDRI "
+    "grunnlag for å anta at tilbudet er gratis. "
+    "Skill tydelig mellom: bekreftet gratis, dokumentert pris, og pris ikke oppgitt. "
+    "Ikke anta at transport, måltider eller materiell er gratis selv om "
+    "selve aktiviteten er gratis. "
+    "PÅMELDING OG HENVISNING: "
+    "Påstå bare at påmelding, søknad eller henvisning kreves eller ikke kreves "
+    "dersom dette står uttrykkelig i kilden. Ellers skriv at det ikke er oppgitt. "
+    "Ikke forveksle manglende dokumentasjon med at kravet ikke finnes. "
+    "GEOGRAFI: "
+    "Skill mellom hvor tilbudet fysisk ligger, og hvem som kan bruke det. "
+    "Et tilbud i Bergen vest er ikke et tilbud i Bergenhus uten uttrykkelig "
+    "dokumentasjon. Tilbud utenfor ønsket bydel skal merkes tydelig og "
+    "bare nevnes dersom kilden bekrefter at målgruppen kan bruke dem. "
+
     "RELEVANS: "
     "Svar direkte på spørsmålet. "
     "Prioriter dokumenter som gjelder riktig geografisk område, "
@@ -1372,76 +1389,68 @@ def render_assistant(message, idx, show_feedback=True, last=False):
 
 
 def scroll_to_latest_answer():
-    """Place the latest user question near the top after the answer is rendered.
+    """Align latest user message after a completed response, not on widget reruns.
 
-    The browser may reposition the page after Streamlit reruns. Retry only for
-    this newly completed answer, and do not rerun when sources are expanded.
+    Streamlit may scroll independently. Find the actual chat container, add
+    bottom space only if necessary, and align after layout stabilizes.
     """
     components.html(r"""<script>
     (function () {
       try {
-        const win = window.parent;
-        const doc = win.document;
-        const started = Date.now();
-        const duration = 5500;
-        let observer = null;
-        let timer = null;
-        let lastUser = null;
+        const win = window.parent, doc = win.document;
+        const started = Date.now(), maxDuration = 4200;
+        let lastHeight = -1, stable = 0;
 
-        function findScroller(element) {
-          let node = element.parentElement;
-          while (node && node !== doc.body) {
-            const style = win.getComputedStyle(node);
+        function newestUser() {
+          const all = [...doc.querySelectorAll('[data-testid="stChatMessage"]')];
+          const users = all.filter(el =>
+            (el.getAttribute('aria-label') || '').toLowerCase().includes('user') ||
+            !!el.querySelector('[data-testid="stChatMessageAvatarUser"]'));
+          return users.length ? users[users.length - 1] : null;
+        }
+        function scrollingParent(el) {
+          let p = el.parentElement;
+          while (p && p !== doc.body) {
+            const style = win.getComputedStyle(p);
             if (/(auto|scroll)/.test(style.overflowY) &&
-                node.scrollHeight > node.clientHeight + 2) return node;
-            node = node.parentElement;
+                p.scrollHeight > p.clientHeight + 3) return p;
+            p = p.parentElement;
           }
           return doc.scrollingElement || doc.documentElement;
         }
-
-        function findLatestQuestion() {
-          const messages = Array.from(doc.querySelectorAll('[data-testid="stChatMessage"]'));
-          const users = messages.filter(el =>
-            (el.getAttribute('aria-label') || '').toLowerCase().includes('user') ||
-            !!el.querySelector('[data-testid="stChatMessageAvatarUser"]')
-          );
-          return users.length ? users[users.length - 1] :
-            (messages.length >= 2 ? messages[messages.length - 2] : null);
+        function align() {
+          const q = newestUser();
+          if (!q) return false;
+          const scroller = scrollingParent(q);
+          const isDoc = scroller === doc.scrollingElement || scroller === doc.documentElement;
+          const top = isDoc ? 0 : scroller.getBoundingClientRect().top;
+          const rect = q.getBoundingClientRect();
+          const viewportHeight = isDoc ? win.innerHeight : scroller.clientHeight;
+          const available = scroller.scrollHeight - scroller.scrollTop - viewportHeight;
+          const needed = Math.max(0, rect.top - top - 14 - available);
+          // Reserve space after the conversation so even short answers can be aligned.
+          const main = q.closest('[data-testid="stMainBlockContainer"]') ||
+                       q.closest('.block-container');
+          if (main) main.style.paddingBottom = 'max(85vh, 720px)';
+          const delta = q.getBoundingClientRect().top - top - 14;
+          scroller.scrollTop += delta;
+          return true;
         }
-
-        function alignQuestion() {
-          const question = findLatestQuestion();
-          if (!question) return;
-          lastUser = question;
-          const scroller = findScroller(question);
-          // Without space below a short final answer, the browser cannot scroll
-          // far enough to put its question at the top of the viewport.
-          const main = question.closest('[data-testid="stMainBlockContainer"]') ||
-                       question.closest('.block-container');
-          if (main) main.style.paddingBottom = 'max(75vh, 620px)';
-          const rect = question.getBoundingClientRect();
-          const containerRect = scroller.getBoundingClientRect();
-          const isDocument = scroller === doc.scrollingElement || scroller === doc.documentElement;
-          const containerTop = isDocument ? 0 : containerRect.top;
-          // Leave a small margin above the newest question.
-          const desired = Math.max(0, scroller.scrollTop + rect.top - containerTop - 18);
-          scroller.scrollTop = desired;
+        function check() {
+          const q = newestUser();
+          if (!q) {
+            if (Date.now() - started < maxDuration) win.setTimeout(check, 120);
+            return;
+          }
+          const height = doc.body.scrollHeight;
+          stable = height === lastHeight ? stable + 1 : 0;
+          lastHeight = height;
+          align();
+          if (Date.now() - started < maxDuration && stable < 7)
+            win.setTimeout(check, 140);
         }
-
-        // Streamlit can change scroll position after the HTML has been inserted.
-        // Re-align through the entire render window, including long AI answers.
-        function tick() {
-          alignQuestion();
-          if (Date.now() - started < duration) timer = win.setTimeout(tick, 180);
-          else if (observer) observer.disconnect();
-        }
-        timer = win.setTimeout(tick, 80);
-        // A mutation observer catches late DOM updates between timed attempts.
-        observer = new win.MutationObserver(() => {
-          if (Date.now() - started < duration) win.requestAnimationFrame(alignQuestion);
-        });
-        observer.observe(doc.body, {childList: true, subtree: true});
-      } catch (e) { /* Browser may block parent access. */ }
+        win.setTimeout(check, 160);
+      } catch (e) { /* Embedded browser restrictions: leave normal scrolling. */ }
     })();
     </script>""", height=0)
 
