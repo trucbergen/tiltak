@@ -77,6 +77,28 @@ st.markdown("""<style>
 /* Bredere sidepanel paa PC, uten aa presse innholdet paa mobil. */
 section[data-testid="stSidebar"] {width: 380px !important; min-width: 380px !important;}
 section[data-testid="stSidebar"] > div {width: 380px !important;}
+/* Fjern unodvendig luft over menyen, og bruk tettere avstand mellom feltene. */
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+  padding-top: .35rem !important;
+  padding-bottom: .65rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap: .55rem !important;}
+section[data-testid="stSidebar"] h1 {font-size: 1.22rem !important; margin: 0 !important; padding: 0 !important;}
+section[data-testid="stSidebar"] hr {margin: .35rem 0 !important;}
+/* Noytrale handlingsknapper: mindre dominerende enn rod primarfarge. */
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"],
+section[data-testid="stSidebar"] button[kind="secondary"] {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #263445;
+  font-weight: 600;
+}
+section[data-testid="stSidebar"] button[kind="secondaryFormSubmit"]:hover,
+section[data-testid="stSidebar"] button[kind="secondary"]:hover {
+  border-color: #94a3b8;
+  background: #e9eef4;
+  color: #172638;
+}
 .block-container {max-width: 1150px; padding-top: 1.5rem; padding-bottom: 4rem;}
 @media (max-width: 768px) {
   section[data-testid="stSidebar"] {width: min(380px, 88vw) !important; min-width: 0 !important;}
@@ -1278,7 +1300,7 @@ def nullstill_filtre():
 with st.sidebar:
     st.title("🔎 Finn kommunale tilbud")
     # Hold ny samtale synlig over filtrene og det store sporsmalsfeltet.
-    if st.button("＋ Ny samtale", use_container_width=True, type="primary"):
+    if st.button("＋ Ny samtale", use_container_width=True, type="secondary"):
         st.session_state.messages = []
         st.session_state.pop("refresh_last", None)
         st.rerun()
@@ -1290,8 +1312,8 @@ with st.sidebar:
     st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
     st.divider()
     with st.form("sporsmal_form", clear_on_submit=True):
-        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=220)
-        sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="primary")
+        skrevet = st.text_area("Still et spørsmål", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=145)
+        sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
 
 valgte = aktive_filtre()
