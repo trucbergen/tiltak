@@ -1525,7 +1525,11 @@ def scroll_to_latest_answer(max_ms=6000):
 
 
 def is_context_followup(question, history):
-    """Detect references to earlier offers, without treating a new topic as a follow-up."""
+    """Only reuse prior sources for genuine follow-up questions.
+
+    A short, standalone question about another service must start a fresh search,
+    even when it is asked in the same chat.
+    """
     if not any(m.get("role") == "assistant" for m in history):
         return False
     q = question.casefold().strip()
@@ -1533,8 +1537,16 @@ def is_context_followup(question, history):
     if any(term in q for term in new_topic):
         return False
     references = ("disse", "dem", "de tilbudene", "de aktivitetene", "av dem",
-                  "hvilke av", "hva med dem", "deres", "nevnte", "ovenfor")
-    return any(term in q for term in references) or len(words_from_question(question)) <= 3
+                  "hvilke av", "hva med dem", "deres", "nevnte", "ovenfor",
+                  "det tilbudet", "dette tilbudet", "den aktiviteten", "de nevnte")
+    if any(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", q) for term in references):
+        return True
+    # Short follow-ups without an explicit reference, such as "Er det gratis?"
+    # or "Må jeg melde meg på?". Do not anchor broad new subjects.
+    followup_starts = ("er det gratis", "koster det", "hva koster", "må jeg melde",
+                       "må man melde", "hvordan melder", "krever det påmelding",
+                       "er påmelding", "når starter det", "hvor foregår det")
+    return any(q.startswith(term) for term in followup_starts)
 
 
 def contextual_search_query(question, history):
@@ -1586,7 +1598,7 @@ st.markdown("""<style>
 head_left, head_right = st.columns([4, 1.6], vertical_alignment="center")
 with head_left:
     st.markdown("### 🔎 Finn tilbud i Bergen")
-    st.caption("Kommunale tjenester og aktiviteter")
+    st.caption("Kommunale tjenester og aktiviteter · Skriv hvem og hvor i spørsmålet")
 with head_right:
     st.button("＋ Ny samtale", on_click=ny_samtale, use_container_width=True)
 st.divider()
@@ -1594,7 +1606,8 @@ st.divider()
 example_clicked = None
 if not st.session_state.messages:
     st.markdown("## Hva kan vi hjelpe deg med?")
-    st.write("Still et spørsmål med egne ord. Du kan gjerne skrive hvem tilbudet gjelder for og hvor i Bergen du bor.")
+    st.write("Still et spørsmål med egne ord. Skriv gjerne hvem tilbudet gjelder for og hvilken bydel du er interessert i.")
+    st.caption("Still oppfølgingsspørsmål i samme samtale. Trykk «Ny samtale» for å teste et nytt spørsmål uavhengig av tidligere svar.")
     st.caption("Prøv et eksempel:")
     examples = [
         "Hvilke aktiviteter finnes for eldre i Åsane?",
@@ -1691,7 +1704,7 @@ if question and question.strip():
                                           if anchored_docs else "")
                                        + "Svar på siste spørsmål med de oppgitte kildene. "
                                          "Ikke anta at et tilbud gjelder en bestemt bydel uten dokumentasjon.")
-                    answer, _usage = generate(answer_question, docs[:AI_SOURCES], history)
+                    answer, _usage = generate(answer_question, docs[:AI_SOURCES], history if followup else [])
                     answer = normalize_markdown(answer)
                     # Modellen fant ingenting relevant: vis ikke dokumentene (de er da urelaterte).
                     first_lines = answer.strip().splitlines()[:3]   # overskrift + foerste punkt
@@ -1708,7 +1721,7 @@ if question and question.strip():
                         code = error_status(exc)
                         if code == "429":
                             answer = ("AI-tjenesten har naa en midlertidig bruksgrense (429). "
-                                      "Vent omtrent ett minutt og trykk «Søk og få svar» igjen. "
+                                      "Vent litt og send spørsmålet på nytt. "
                                       "Dokumenttreffene er fortsatt tilgjengelige nedenfor.")
                         else:
                             answer = ("AI-tjenesten svarte ikke akkurat naa "
