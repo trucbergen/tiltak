@@ -1310,87 +1310,52 @@ def render_documents(docs, key, start=1):
             st.rerun()
 
 
+def date_sort_documents(docs):
+    """Sort newest first; undated documents last, preserving stable source IDs."""
+    def key(d):
+        date = str(d.get("dokumentdato") or "")[:10]
+        return date if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else ""
+    return sorted(docs, key=key, reverse=True)
+
+
 def render_assistant(message, idx, show_feedback=True, last=False):
-    # AI-svaret er historisk og endres ikke ved filtervalg. Bare dokumentlisten
-    # nedenfor oppdateres fra allerede lagrede kandidater.
-    saved_filters = message.get("filters") or {}
-    current_filters = aktive_filtre() if last else saved_filters
-    changed_filters = last and bool(saved_filters) and any(
-        saved_filters.get(k) != current_filters.get(k)
-        for k in ("målgruppe", "område", "informasjonstype", "sortering")
-    )
-    if saved_filters:
-        labels = [str(saved_filters.get(k)) for k in ("målgruppe", "område", "informasjonstype")
-                  if saved_filters.get(k) not in (None, "Alle", "Hele Bergen")]
-        st.caption("AI-svaret ble laget for: " +
-                   (" · ".join(labels) if labels else "Hele Bergen · Alle målgrupper og typer"))
-    if changed_filters:
-        st.info("Filtrene er endret. Dokumentlisten nedenfor er oppdatert uten nytt søk eller AI-kall. "
-                "AI-svaret over listen er fortsatt basert på de opprinnelige filtrene. "
-                "Trykk «Søk og få svar» for et nytt AI-svar med de valgte filtrene.")
     if message.get("note"):
         st.caption("✏️ " + message["note"])
-    # Antall kandidater er ikke det samme som totalt antall FTS-treff.
-    if message.get("count_context") is not None:
-        raw = message.get("raw_docs") or []
-        shown = len(filter_and_sort_documents(
-            raw, current_filters.get("målgruppe", "Alle"),
-            current_filters.get("område", "Hele Bergen"),
-            current_filters.get("informasjonstype", "Alle"),
-            current_filters.get("sortering", "Mest relevant")))
-        total = message.get("all_total", message.get("actual_total", 0))
-        st.markdown(f"**{shown} dokumenter i resultatlisten · {total:,} treff i søket totalt**".replace(",", " "))
-        with st.expander("Hva betyr treffantallene?"):
-            st.write("Resultatlisten bygger på inntil 300 lagrede søkekandidater. "
-                     "Målgruppe og område prioriterer relevante dokumenter, men skjuler ikke "
-                     "andre dokumenter automatisk. Informasjonstype avgrenser listen. "
-                     "Totaltallet gjelder det opprinnelige søket, før filtre.")
     st.markdown(message.get("content") or "Ingen svar.")
-    # Vagt spoersmaal: knapper for aa avgrense (som «Avgrens søket» paa kommunens nettside)
-    if message.get("choices") and last:
-        cols = st.columns(min(3, len(message["choices"])))
-        for n, label in enumerate(message["choices"]):
-            with cols[n % len(cols)]:
-                if st.button(label, key=f"ch_{message.get('id')}_{n}", use_container_width=True):
-                    st.session_state["pending_q"] = f"{message.get('query', '')} {label.lower()}".strip()
-                    st.rerun()
-    # AI-kildene beholder sine opprinnelige numre. Flere dokumenter vises
-    # fra lagrede kandidater, uten nytt databasesok eller Groq-kall.
-    docs = message.get("sources") or []
-    if docs:
-        if message.get("filters") and not changed_filters:
-            f = message["filters"]
-            aktive_etiketter = [
-                str(f[k]) for k in ("målgruppe", "område", "informasjonstype")
-                if f.get(k) not in (None, "Alle", "Hele Bergen")
-            ]
-            if aktive_etiketter:
-                st.markdown("**Valgte filtre:** " + " · ".join(aktive_etiketter))
-        st.caption("Svaret bygger på informasjon fra kommunale dokumenter. Kontroller detaljene hos kommunen.")
-        mid = str(message.get("id") or idx)
-        # Etter filterendring vises opprinnelige AI-kilder fortsatt separat,
-        # mens den filtrerte kandidatlisten ligger nedenfor.
-        with st.expander(f"📄 Kilder til svaret ({len(set(int(n) for n in re.findall(r'\[(\d+)\]', message.get('content') or '') if 1 <= int(n) <= len(docs)))})"):
-            st.caption("Tallene [1], [2] osv. i svaret viser til disse kildene.")
-            render_documents(docs, f"{mid}_sources", 1)
-
-    # Filtrering og paginering gjøres kun i minnet, uten Groq eller nytt søk.
-    if message.get("raw_docs") is not None:
-        raw = message.get("raw_docs") or []
-        candidates = filter_and_sort_documents(
-            raw, current_filters.get("målgruppe", "Alle"),
-            current_filters.get("område", "Hele Bergen"),
-            current_filters.get("informasjonstype", "Alle"),
-            current_filters.get("sortering", "Mest relevant"))
-        mid = str(message.get("id") or idx)
+    mid = str(message.get("id") or idx)
+    sources = message.get("sources") or []
+    candidates = message.get("display_docs") or []
+    if sources or candidates:
+        st.caption("Svarene bygger på kommunale dokumenter. Kontroller viktige opplysninger hos kommunen.")
+        st.markdown("**Dokumentasjon**")
+        sort = st.radio("Sorter dokumenter", ["Mest relevant", "Nyeste først"],
+                        key=f"sort_{mid}", horizontal=True)
+        if sources:
+            # Only show documents actually cited. The original [n] number must never change.
+            cited = {int(n) for n in re.findall(r"\[(\d+)\]", message.get("content") or "")}
+            cited_docs = [dict(d, _source_number=i) for i, d in enumerate(sources, 1) if i in cited]
+            if sort == "Nyeste først":
+                cited_docs = date_sort_documents(cited_docs)
+            with st.expander(f"📄 Kilder til svaret ({len(cited_docs)})"):
+                if cited_docs:
+                    st.caption("Kildenummer [1], [2] osv. er de samme som i AI-svaret, også ved datosortering.")
+                    for d in cited_docs:
+                        with st.container(border=True):
+                            st.markdown(f"**[{d['_source_number']}] {html.escape(str(d.get('tittel') or 'Uten tittel'))}**")
+                            st.caption(f"Dokumentdato: {d.get('dokumentdato') or 'Udatert'}")
+                            st.write(clean_summary(d.get("oppsummering") or d.get("tekstutdrag")))
+                            url = str(d.get("url") or "").strip()
+                            if url.startswith(("https://", "http://")):
+                                st.link_button("Les på kommunens nettside", url)
+                else:
+                    st.caption("Ingen kilder ble sitert i AI-svaret.")
         if candidates:
-            with st.expander(f"🔎 Se flere treff ({len(candidates)})", expanded=False):
-                st.caption("Viser inntil 300 dokumenter fra det opprinnelige søket. "
-                           "Målgruppe og område prioriteres; informasjonstype filtreres.")
-                render_documents(candidates, f"{mid}_candidates", 1)
-        else:
-            st.info("Ingen av de lagrede dokumentene har denne informasjonstypen. "
-                    "Velg «Alle» eller still et nytt spørsmål.")
+            listed = date_sort_documents(candidates) if sort == "Nyeste først" else candidates
+            with st.expander(f"🔎 Se flere dokumenttreff ({len(listed)})"):
+                total = message.get("all_total", len(listed))
+                st.caption(f"Viser {len(listed)} rangerte dokumenter fra søket ({total} treff totalt før kandidatgrensen). "
+                           "Dokumenter uten dato kommer sist ved 'Nyeste først'.")
+                render_documents(listed, f"{mid}_more_{sort}", 1)
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1405,6 +1370,19 @@ def render_assistant(message, idx, show_feedback=True, last=False):
                 st.caption("✓ Vurderingen er lagret. Skriv gjerne en kommentar.")
 
 
+def contextual_search_query(question, history):
+    """Keep topic and geography for short follow-ups without another AI request."""
+    previous = next((m.get("content", "") for m in reversed(history)
+                     if m.get("role") == "user"), "")
+    if not previous:
+        return question
+    q = question.casefold()
+    followup_words = ("disse", "dette", "dem", "de tilbudene", "av dem", "der", "gratis",
+                      "påmelding", "melde meg", "hva koster", "hvilke av", "når er")
+    if len(words_from_question(question)) <= 3 or any(w in q for w in followup_words):
+        return previous + " " + question
+    return question
+
 if not DB_PATH.is_file():
     st.error("Dokumentdatabasen er ikke tilgjengelig. Kontakt den som drifter tjenesten.")
     st.stop()
@@ -1418,84 +1396,47 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
     st.session_state.session_id = uuid.uuid4().hex[:8]
-if "question_widget_version" not in st.session_state:
-    st.session_state.question_widget_version = 0
-
-# Sidepanelet fungerer pa PC og kollapser automatisk pa mobil.
-def aktive_filtre():
-    return {"målgruppe": st.session_state.get("filter_malgruppe", "Alle"),
-            "område": st.session_state.get("filter_omrade", "Hele Bergen"),
-            "informasjonstype": st.session_state.get("filter_type", "Alle"),
-            "sortering": st.session_state.get("filter_sortering", "Mest relevant")}
-
-
-def oppdater_siste_svar():
-    """Oppdater bare den lokale visningen. Ikke start nytt søk eller Groq-kall."""
-    messages = st.session_state.get("messages", [])
-    if messages and messages[-1].get("role") == "assistant":
-        mid = messages[-1].get("id")
-        if mid:
-            st.session_state[f"page_{mid}_candidates"] = 1
-
-
-def nullstill_filtre():
-    st.session_state["filter_malgruppe"] = "Alle"
-    st.session_state["filter_omrade"] = "Hele Bergen"
-    st.session_state["filter_type"] = "Alle"
-    st.session_state["filter_sortering"] = "Mest relevant"
-    oppdater_siste_svar()
-
-
 def ny_samtale():
-    # Widget-verdier maa nullstilles i callback foer widgetene opprettes.
     st.session_state.messages = []
     st.session_state.session_id = uuid.uuid4().hex[:8]
-    # Nullstill direkte, uten å oppdatere et gammelt svar.
-    st.session_state["filter_malgruppe"] = "Alle"
-    st.session_state["filter_omrade"] = "Hele Bergen"
-    st.session_state["filter_type"] = "Alle"
-    st.session_state["filter_sortering"] = "Mest relevant"
-    st.session_state.pop("refresh_last", None)
-    # Bruk ny widget-noekkel slik at Streamlit oppretter et tomt tekstfelt.
-    # Dette fungerer ogsaa naar tekstfeltet ligger inne i en st.form.
-    st.session_state.question_widget_version += 1
     st.session_state.pop("pending_q", None)
+    st.session_state.pop("last_search_topic", None)
 
 
-with st.sidebar:
-    st.title("🔎 Finn tilbud")
-    st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
-    st.caption("Velg hvem og hvor du søker etter tilbud.")
-    st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
-    st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
-    st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type", on_change=oppdater_siste_svar)
-    st.radio("Sortering", ["Mest relevant", "Nyeste først"], key="filter_sortering", on_change=oppdater_siste_svar)
-    st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
-    st.divider()
-    with st.form("sporsmal_form", clear_on_submit=False):
-        skrevet = st.text_area("Still et spørsmål", key=f"sporsmal_input_{st.session_state.question_widget_version}", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
-        sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
-    st.button("＋ Ny samtale", on_click=ny_samtale, use_container_width=True, type="secondary")
-    st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
+st.markdown("""<style>
+/* Large readable main column for residents; no mandatory sidebar. */
+.block-container {max-width: 950px; padding-top: 1.3rem;}
+.stChatInput {max-width: 950px;}
+</style>""", unsafe_allow_html=True)
 
-valgte = aktive_filtre()
-valgt_malgruppe = valgte["målgruppe"]
-valgt_omrade = valgte["område"]
-valgt_type = valgte["informasjonstype"]
-valgt_sortering = valgte["sortering"]
-
-st.markdown('<div class="hero"><h1>Hva kan vi hjelpe deg med?</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
-
-# Filtre gjelder bare nye soek. Eldre svar og kilder endres ikke.
-# Dette hindrer at et tidligere AI-svar ser ut til aa gjelde nye filtre.
+head_left, head_right = st.columns([4, 1.6], vertical_alignment="center")
+with head_left:
+    st.markdown("### 🔎 Finn tilbud i Bergen")
+    st.caption("Kommunale tjenester og aktiviteter")
+with head_right:
+    st.button("＋ Ny samtale", on_click=ny_samtale, use_container_width=True)
+st.divider()
 
 example_clicked = None
 if not st.session_state.messages:
-    st.caption("Eksempler på spørsmål:")
-    for ex_col, example in zip(st.columns(len(EXAMPLE_QUESTIONS)), EXAMPLE_QUESTIONS):
-        with ex_col:
-            if st.button(example, use_container_width=True, key=f"ex_{example}"):
+    st.markdown("## Hva kan vi hjelpe deg med?")
+    st.write("Still et spørsmål med egne ord. Du kan gjerne skrive hvem tilbudet gjelder for og hvor i Bergen du bor.")
+    st.caption("Prøv et eksempel:")
+    examples = [
+        "Hvilke aktiviteter finnes for eldre i Åsane?",
+        "Hvilke fritidsaktiviteter finnes for barn og unge i Fana?",
+        "Hvor kan jeg få hjelp med psykisk helse i Bergen?",
+        "Hvilke gratis aktiviteter finnes i Fyllingsdalen?",
+    ]
+    for col, example in zip(st.columns(2), examples[:2]):
+        with col:
+            if st.button(example, key="example_" + str(examples.index(example)), use_container_width=True):
                 example_clicked = example
+    for col, example in zip(st.columns(2), examples[2:]):
+        with col:
+            if st.button(example, key="example_" + str(examples.index(example)), use_container_width=True):
+                example_clicked = example
+    st.caption("Ikke skriv personopplysninger. Kontroller viktige detaljer hos kommunen.")
 
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
@@ -1504,28 +1445,31 @@ for i, message in enumerate(st.session_state.messages):
         else:
             render_assistant(message, i, last=(i == len(st.session_state.messages) - 1))
 
-question = (skrevet if sendt else None) or example_clicked or st.session_state.pop("pending_q", None)
+written = st.chat_input("Still et spørsmål eller et oppfølgingsspørsmål …", max_chars=1200)
+question = written or example_clicked or st.session_state.pop("pending_q", None)
 if question and question.strip():
     st.session_state.pop("pending_q", None)
     question = question.strip()[:1200]
     asked = question                                   # det brukeren skrev (vises i chatten)
-    question, spell_fixes = correct_spelling(question)  # brukes til soek og svar
     history = list(st.session_state.messages)
+    previous_topic = st.session_state.get("last_search_topic", "")
+    search_history = ([{"role": "user", "content": previous_topic}] if previous_topic else history)
+    search_question = contextual_search_query(question, search_history)
+    st.session_state["last_search_topic"] = search_question[:500]
+    search_question, spell_fixes = correct_spelling(search_question)
+    question = question  # original question is retained for chat display
     st.session_state.messages.append({"role": "user", "content": asked})
     with st.chat_message("user"):
         st.markdown(asked)
     with st.chat_message("assistant"):
         try:
             with st.spinner("Søker i dokumentene ..."):
-                docs, total, _mode, _note, count_context = run_search(question, SEARCH_METHOD)
-                actual_total = count_full_search_matches(count_context, valgt_type)
+                docs, total, _mode, _note, count_context = run_search(search_question, SEARCH_METHOD)
+                actual_total = count_full_search_matches(count_context)
                 all_total = count_full_search_matches(count_context)
                 raw_docs = [dict(d) for d in docs]
-                docs = filter_and_sort_documents(
-                    docs, valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
                 total = actual_total
-                if valgt_sortering == "Mest relevant":
-                    docs = diversify(docs)
+                docs = diversify(docs)
         except sqlite3.Error:
             st.error("Søket feilet. Prøv igjen.")
             st.stop()
@@ -1546,12 +1490,12 @@ if question and question.strip():
         else:
             with st.spinner("Lager svar ..."):
                 try:
-                    filter_context = (f"\nValgte søkefiltre: målgruppe={valgt_malgruppe}; "
-                                      f"område={valgt_omrade}; informasjonstype={valgt_type}. "
-                                      "Skill mellom aktiviteter som foregår i bydelen og "
-                                      "kommuneomfattende tilbud; ikke anta fysisk plassering. "
-                                      "Ikke påstå at et tilbud er åpent for alle uten kildestøtte.")
-                    answer, _usage = generate(question + filter_context, docs[:AI_SOURCES], history)
+                    # Follow-ups use earlier topic in retrieval and current wording in the answer.
+                    answer_question = (f"Tidligere tema: {search_question}\n"
+                                       f"Brukerens siste spørsmål: {question}\n"
+                                       "Svar på det siste spørsmålet, med kildene nedenfor. "
+                                       "Ikke anta at et tilbud gjelder en bestemt bydel uten dokumentasjon.")
+                    answer, _usage = generate(answer_question, docs[:AI_SOURCES], history)
                     answer = normalize_markdown(answer)
                     # Modellen fant ingenting relevant: vis ikke dokumentene (de er da urelaterte).
                     first_lines = answer.strip().splitlines()[:3]   # overskrift + foerste punkt
@@ -1590,9 +1534,8 @@ if question and question.strip():
         message = {"role": "assistant", "content": answer, "note": note,
                    "sources": [] if hide_sources else docs[:SOURCES_MAX], "total": total,
                    "choices": choices, "query": asked,
-                   "filters": {"målgruppe": valgt_malgruppe, "område": valgt_omrade,
-                               "informasjonstype": valgt_type, "sortering": valgt_sortering},
-                   "id": answer_id, "raw_docs": raw_docs, "display_docs": docs, "query_corrected": question,
+                   "filters": {},
+                   "id": answer_id, "raw_docs": raw_docs, "display_docs": docs, "query_corrected": search_question,
                    "count_context": count_context, "actual_total": actual_total,
                    "all_total": all_total,
                    "ai_input_ids": ai_input_ids}
@@ -1604,7 +1547,7 @@ if question and question.strip():
             GROQ_MODEL, f"{time.perf_counter() - t0:.1f}", status,
         ])
         # Vurdering vises foerst etter omlastingen under (unngaar dobbel widget).
-        render_assistant(message, len(st.session_state.messages), show_feedback=False)
+        st.markdown(answer)
     st.session_state.messages.append(message)
     # Ny kjoering slik at eksempelknappene forsvinner og «Ny samtale» vises.
     st.rerun()
