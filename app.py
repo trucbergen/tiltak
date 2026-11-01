@@ -339,8 +339,10 @@ def search_documents(question):
     bonus_parts.append(f"(CASE WHEN d.url LIKE '%/innbyggerhjelpen/%' THEN {SERVICE_BONUS} ELSE 0 END)")
     bonus_sql = " + ".join(bonus_parts) or "0"
 
+    extras = ",".join(f"d.{c}" for c in document_filter_fields())
+    extras = ("," + extras) if extras else ""
     sql = f"""SELECT d.doc_id,d.tittel,d.url,d.oppsummering,d.tekstutdrag,
-                      d.tema,d.malgruppe,d.informasjonstype,d.kommune,d.dokumentdato,
+                      d.tema,d.malgruppe,d.informasjonstype,d.kommune,d.dokumentdato{extras},
                       {bm25} AS score
                FROM documents_fts_full
                JOIN documents d ON d.rowid=documents_fts_full.rowid
@@ -568,11 +570,13 @@ def fetch_documents(doc_ids):
     if not doc_ids:
         return []
     marks = ",".join("?" * len(doc_ids))
+    extras = ",".join(document_filter_fields())
+    extras = ("," + extras) if extras else ""
     with connect() as con:
         con.row_factory = sqlite3.Row
         rows = con.execute(
             f"""SELECT doc_id,tittel,url,oppsummering,tekstutdrag,tema,malgruppe,
-                       informasjonstype,kommune,dokumentdato
+                       informasjonstype,kommune,dokumentdato{extras}
                 FROM documents WHERE doc_id IN ({marks})""", list(doc_ids)).fetchall()
     by_id = {r["doc_id"]: dict(r) for r in rows}
     return [by_id[d] for d in doc_ids if d in by_id]
@@ -592,6 +596,81 @@ def rrf_merge(*rankings, k=RRF_K, weights=None):
             if li == 0:
                 first_rank.setdefault(doc_id, rank)
     return sorted(scores, key=lambda d: (-round(scores[d], 12), first_rank.get(d, 10**9), d))
+
+
+# Filtre leses fra dokumentdatabasen. Ingen ny AI-kjoring er nodvendig.
+BYDELER_VALG = ["Arna", "Bergenhus", "Fana", "Fyllingsdalen", "Laksevåg", "Ytrebygda", "Årstad", "Åsane"]
+MALGRUPPE_VALG = ["Alle", "Barn og unge", "Eldre", "Voksne", "Familier", "Personer med funksjonsnedsettelse"]
+MALGRUPPE_ORD = {
+    "Barn og unge": ("barn", "unge", "ungdom", "elev", "tenår", "0-17", "13-23"),
+    "Eldre": ("eldre", "senior", "pensjonist", "demens"),
+    "Voksne": ("voksne", "voksen"),
+    "Familier": ("familie", "foreldre", "foresatte"),
+    "Personer med funksjonsnedsettelse": ("funksjonsnedsett", "funksjonshemm", "tilrettelegg"),
+}
+
+
+def document_columns():
+    with connect() as con:
+        return {r[1] for r in con.execute("PRAGMA table_info(documents)")}
+
+
+def document_filter_fields():
+    cols = document_columns()
+    return [c for c in ("bydeler", "bydel_omfang", "geografi") if c in cols]
+
+
+def information_types():
+    with connect() as con:
+        return [r[0] for r in con.execute(
+            "SELECT DISTINCT informasjonstype FROM documents "
+            "WHERE informasjonstype IS NOT NULL AND trim(informasjonstype) <> '' "
+            "ORDER BY informasjonstype")]
+
+
+def filter_and_sort_documents(docs, malgruppe="Alle", omrade="Hele Bergen",
+                              informasjonstype="Alle", sortering="Mest relevant"):
+    """Bruk metadata etter hybrid sok. Omrade/malgruppe gir prioritet, ikke tap av treff.
+
+    Informasjonstype er et eksakt filter. Omrade kan ikke behandles som eksakt
+    uten risiko for aa miste kommuneomfattende tilbud eller feilmerkede dokumenter.
+    """
+    def normal(t):
+        return str(t or "").casefold()
+
+    def score(d):
+        score_ = 0
+        if malgruppe != "Alle":
+            group_text = normal(d.get("malgruppe"))
+            # Bruk bare malgruppe som sterk indikator; fritekst er ikke standardisert.
+            if any(word in group_text for word in MALGRUPPE_ORD[malgruppe]):
+                score_ += 5
+            elif any(word in normal(d.get("tittel")) for word in MALGRUPPE_ORD[malgruppe]):
+                score_ += 2
+        if omrade != "Hele Bergen":
+            bydel = normal(d.get("bydeler"))
+            geo = normal(d.get("geografi"))
+            title = normal(d.get("tittel"))
+            scope = normal(d.get("bydel_omfang"))
+            if normal(omrade) in [x.strip() for x in bydel.split(";")]:
+                score_ += 8
+            elif normal(omrade) in title or normal(omrade) in geo:
+                score_ += 5
+            elif scope == "hele kommunen":
+                score_ += 2  # svak indikator; 05b kan ha brukt antall bydelstreff
+        return score_
+
+    selected = [d for d in docs if informasjonstype == "Alle" or
+                normal(d.get("informasjonstype")) == normal(informasjonstype)]
+    # Stabil sortering: behold den opprinnelige FTS/vektor-rangeringen ved lik score.
+    selected.sort(key=score, reverse=True)
+    if sortering == "Nyeste først":
+        # Dato bare innenfor soketreffene. Manglende/ugyldig dato sist.
+        def date_key(d):
+            v = str(d.get("dokumentdato") or "")
+            return v[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v[:10]) else ""
+        selected.sort(key=date_key, reverse=True)
+    return selected
 
 
 def run_search(question, method):
@@ -799,6 +878,9 @@ def context(docs):
             f"URL: {doc.get('url') or ''}\nKommune: {doc.get('kommune') or ''}\n"
             f"Tema: {strip_contact(doc.get('tema'))}\nType: {doc.get('informasjonstype') or ''}\n"
             f"Sidetype: {page_type(doc.get('url'))}\n"
+            f"Målgruppe: {doc.get('malgruppe') or 'Ikke spesifisert'}\n"
+            f"Bydeler nevnt: {doc.get('bydeler') or 'Ikke spesifisert'}\n"
+            f"Bydelsomfang (automatisk): {doc.get('bydel_omfang') or 'Ikke spesifisert'}\n"
             f"{('Oppsummering: ' + summary + chr(10) + 'Utdrag: ' + excerpt)[:MAX_CONTEXT_CHARS]}"
         )
     return "\n\n".join(blocks)
@@ -1173,7 +1255,14 @@ def render_documents(docs, key, start=1):
             sti = page_path(doc.get("url"))
             st.caption(" · ".join(x for x in [page_type(doc.get("url")), sti,
                                               doc.get("dokumentdato") or "Udatert"] if x))
-            st.text(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
+            details = [
+                f"Type: {doc.get('informasjonstype')}" if doc.get('informasjonstype') else "",
+                f"Målgruppe: {doc.get('malgruppe')}" if doc.get('malgruppe') else "",
+                f"Bydeler: {doc.get('bydeler')}" if doc.get('bydeler') else "",
+            ]
+            if any(details):
+                st.caption(" · ".join(x for x in details if x))
+            st.markdown(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
                 st.link_button("Åpne originaldokument", url)
@@ -1209,7 +1298,7 @@ def render_assistant(message, idx, show_feedback=True, last=False):
         total = message.get("total", len(docs))
         mid = str(message.get("id") or idx)
         aktuelt, andre = split_sources(docs, message.get("query") or "")
-        with st.expander(f"📄 Kilder ({len(docs)})"):
+        with st.expander(f"📄 Dokumenter og kilder ({len(docs)})"):
             fane1, fane2 = st.tabs([f"Mest aktuelt ({len(aktuelt)})", f"Andre treff ({len(andre)})"])
             with fane1:
                 if any(d.get("_brukt") for d in aktuelt):
@@ -1261,6 +1350,20 @@ with head_right:
         st.session_state.messages = []
         st.rerun()
 
+# Valgfrie filtre. Standardvalgene gir samme sok som tidligere.
+st.markdown("#### Avgrens søket")
+f1, f2, f3 = st.columns(3)
+with f1:
+    valgt_malgruppe = st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe")
+with f2:
+    valgt_omrade = st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade")
+with f3:
+    valgt_type = st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type")
+valgt_sortering = st.radio("Sortering", ["Mest relevant", "Nyeste først"],
+                          horizontal=True, key="filter_sortering")
+st.caption("Målgruppe og område prioriterer treff. Informasjonstype avgrenser treffene. "
+           "'Nyeste først' sorterer relevante søketreff etter dato.")
+
 example_clicked = None
 if not st.session_state.messages:
     st.caption("Prøv for eksempel:")
@@ -1293,7 +1396,11 @@ if question and question.strip():
         try:
             with st.spinner("Søker i dokumentene ..."):
                 docs, total, _mode, _note = run_search(question, SEARCH_METHOD)
-                docs = diversify(docs)
+                docs = filter_and_sort_documents(
+                    docs, valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
+                total = len(docs) if valgt_type != "Alle" else total
+                if valgt_sortering == "Mest relevant":
+                    docs = diversify(docs)
         except sqlite3.Error:
             st.error("Søket feilet. Prøv igjen.")
             st.stop()
@@ -1312,7 +1419,12 @@ if question and question.strip():
         else:
             with st.spinner("Lager svar ..."):
                 try:
-                    answer, _usage = generate(question, docs[:AI_SOURCES], history)
+                    filter_context = (f"\nValgte søkefiltre: målgruppe={valgt_malgruppe}; "
+                                      f"område={valgt_omrade}; informasjonstype={valgt_type}. "
+                                      "Skill mellom aktiviteter som foregår i bydelen og "
+                                      "kommuneomfattende tilbud; ikke anta fysisk plassering. "
+                                      "Ikke påstå at et tilbud er åpent for alle uten kildestøtte.")
+                    answer, _usage = generate(question + filter_context, docs[:AI_SOURCES], history)
                     answer = normalize_markdown(answer)
                     # Modellen fant ingenting relevant: vis ikke dokumentene (de er da urelaterte).
                     first_lines = answer.strip().splitlines()[:3]   # overskrift + foerste punkt
@@ -1340,6 +1452,8 @@ if question and question.strip():
         message = {"role": "assistant", "content": answer, "note": note,
                    "sources": [] if hide_sources else docs[:SOURCES_MAX], "total": total,
                    "choices": choices, "query": asked,
+                   "filters": {"målgruppe": valgt_malgruppe, "område": valgt_omrade,
+                               "informasjonstype": valgt_type, "sortering": valgt_sortering},
                    "id": answer_id}
         top = docs[:AI_SOURCES]
         log_event("svar", [
