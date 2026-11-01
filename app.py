@@ -1286,7 +1286,7 @@ def render_documents(docs, key, start=1):
             st.markdown(clean_summary(doc.get("oppsummering") or doc.get("tekstutdrag")))
             url = str(doc.get("url") or "").strip()
             if url.startswith(("https://", "http://")):
-                st.link_button("Åpne originaldokument", url)
+                st.link_button("Les på kommunens nettside", url)
     if pages > 1:
         visible_pages = sorted(set([1, pages] + list(range(max(1, page - 2), min(pages, page + 2) + 1))))
         st.caption(f"Viser {first + 1}–{min(first + PAGE_SIZE, len(docs))} av {len(docs)} · Side {page} av {pages}")
@@ -1306,27 +1306,17 @@ def render_documents(docs, key, start=1):
 def render_assistant(message, idx, show_feedback=True, last=False):
     if message.get("note"):
         st.caption("✏️ " + message["note"])
-    # Antallet telles i hele databasen, ikke bare blant de 300 kandidatene.
+    # Vis bare tall som er enkle aa forstaa. Resultatlisten er begrenset
+    # til de kandidatene som ble hentet ved dette soeket.
     if message.get("count_context") is not None:
-        current = message.get("actual_total", 0)
-        overall = message.get("all_total", current)
-        f = message.get("filters") or {}
-        local_filter = f.get("område", "Hele Bergen") != "Hele Bergen" or f.get("målgruppe", "Alle") != "Alle"
-        if local_filter:
-            n = len(message.get("filtered_docs", message.get("raw_docs") or []))
-            st.markdown(f"**{n} filtrerte dokumenter blant de hentede kandidatene**")
-            st.caption(f"{current:,} treff i hele databasen før område- og målgruppefilter. ".replace(",", " ") +
-                       "Det filtrerte antallet gjelder bare de inntil 300 dokumentene som ble hentet.")
-        else:
-            st.markdown(f"**{current:,} dokumenttreff**".replace(",", " "))
-        if current != overall:
-            st.caption(f"{overall:,} treff totalt før informasjonstypefilter · ".replace(",", " ") +
-                       f"Inntil {MAX_LIST_RESULTS} kandidater hentes til visning.")
-        else:
-            st.caption(f"Treff i hele databasen for sokemotorens valgte uttrykk · Inntil {MAX_LIST_RESULTS} kandidater hentes til visning.")
-        st.caption("Tallet gjelder unike dokumenter, ikke antall kommunale tilbud. "
-                   "Område og målgruppe prioriterer treff, men begrenser ikke antallet. "
-                   "Hybridsøk teller FTS-treff og de semantiske kandidatene som søkemotoren valgte.")
+        shown = len(message.get("display_docs") or [])
+        total = message.get("all_total", message.get("actual_total", 0))
+        st.markdown(f"**{shown} treff i resultatlisten · {total:,} treff i søket totalt**".replace(",", " "))
+        with st.expander("Hva betyr treffantallene?"):
+            st.write("Treffene er dokumenter fra kommunen, ikke antall ulike tilbud. "
+                     "Resultatlisten viser dokumenter som passer filtrene dine, "
+                     "blant de inntil 300 dokumentene som ble hentet fra søket. "
+                     "Det totale tallet gjelder søket før filtrene ble brukt.")
     st.markdown(message.get("content") or "Ingen svar.")
     # Vagt spoersmaal: knapper for aa avgrense (som «Avgrens søket» paa kommunens nettside)
     if message.get("choices") and last:
@@ -1348,35 +1338,24 @@ def render_assistant(message, idx, show_feedback=True, last=False):
             ]
             if aktive_etiketter:
                 st.markdown("**Valgte filtre:** " + " · ".join(aktive_etiketter))
-        st.caption("AI-svar bygger på utdrag fra kommunale dokumenter. Kontroller alltid kildene.")
+        st.caption("Svaret bygger på informasjon fra kommunale dokumenter. Kontroller detaljene hos kommunen.")
         mid = str(message.get("id") or idx)
         # Etter filterendring vises opprinnelige AI-kilder fortsatt separat,
         # mens den filtrerte kandidatlisten ligger nedenfor.
-        with st.expander(f"📄 Dokumenter og kilder ({len(docs)} AI-kilder)"):
-            st.caption("Numrene [1], [2] osv. i AI-svaret viser til disse opprinnelige kildene.")
+        with st.expander("📄 Kilder til svaret"):
+            st.caption("Tallene [1], [2] osv. i svaret viser til disse kildene.")
             render_documents(docs, f"{mid}_sources", 1)
 
-    # Lagret kandidatsett (inntil 300) vises trinnvis, 30 av gangen.
-    # raw_docs er hentet ved forste sporsmal og oppdateres ikke ved filtervalg.
+    # Vis flere dokumenter fra samme soek, uten nye API-kall.
     if message.get("raw_docs") is not None:
-        if "filtered_docs" in message:
-            candidates = message["filtered_docs"]
-            if message.get("filter_update_error"):
-                st.warning("Kunne ikke oppdatere AI-svaret. Kildene over gjelder forrige filtervalg. "
-                           "Prøv å endre filteret igjen.")
-            else:
-                st.caption("Dokumenttreffene er oppdatert fra lagret søk, uten ny vektorisering.")
-        else:
-            candidates = message["raw_docs"]
-        candidates = candidates or []
-        total_candidates = len(candidates)
-        if total_candidates:
-            st.caption(f"{total_candidates} hentede kandidater. Bla mellom sidene med 10 dokumenter per side.")
-            with st.expander(f"🔎 Utforsk dokumenttreff ({total_candidates})", expanded=False):
+        candidates = message.get("display_docs") or []
+        if candidates:
+            with st.expander(f"🔎 Se flere treff ({len(candidates)})", expanded=False):
+                st.caption("De mest relevante dokumentene vises først. Velg Neste for å se flere.")
                 render_documents(candidates, f"{mid}_candidates", 1)
-        elif "filtered_docs" in message:
-            st.caption("Ingen dokumenter i det lagrede kandidatutvalget passer filtrene. "
-                       "Prov et annet filter eller et nytt sporsmal.")
+        else:
+            st.info("Ingen dokumenter i resultatlisten passer filtrene. "
+                    "Prøv et annet område eller et nytt spørsmål.")
     answer_id = message.get("id")
     if show_feedback and answer_id and logging_enabled():
         st.caption("Var svaret nyttig?")
@@ -1414,8 +1393,8 @@ def aktive_filtre():
 
 
 def oppdater_siste_svar():
-    # Filtrene gjelder neste sporsmal og oppdaterer siste svar uten ny brukermelding.
-    st.session_state["refresh_last"] = True
+    # Ingen automatisk oppdatering: filtrene brukes ved neste soek.
+    pass
 
 
 def nullstill_filtre():
@@ -1423,7 +1402,6 @@ def nullstill_filtre():
     st.session_state["filter_omrade"] = "Hele Bergen"
     st.session_state["filter_type"] = "Alle"
     st.session_state["filter_sortering"] = "Mest relevant"
-    oppdater_siste_svar()
 
 
 def ny_samtale():
@@ -1437,11 +1415,11 @@ def ny_samtale():
 with st.sidebar:
     st.title("🔎 Finn tilbud")
     st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
-    st.caption("Velg filtre én gang. De gjelder også neste spørsmål.")
-    st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe", on_change=oppdater_siste_svar)
-    st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade", on_change=oppdater_siste_svar)
-    st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type", on_change=oppdater_siste_svar)
-    st.radio("Sortering", ["Mest relevant", "Nyeste først"], key="filter_sortering", on_change=oppdater_siste_svar)
+    st.caption("Velg det du er interessert i, og trykk Søk og få svar.")
+    st.selectbox("Målgruppe", MALGRUPPE_VALG, key="filter_malgruppe")
+    st.selectbox("Område", ["Hele Bergen"] + BYDELER_VALG, key="filter_omrade")
+    st.selectbox("Informasjonstype", ["Alle"] + information_types(), key="filter_type")
+    st.radio("Sortering", ["Mest relevant", "Nyeste først"], key="filter_sortering")
     st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
     st.divider()
     with st.form("sporsmal_form", clear_on_submit=True):
@@ -1458,22 +1436,8 @@ valgt_sortering = valgte["sortering"]
 
 st.markdown('<div class="hero"><h1>Hva kan vi hjelpe deg med?</h1><p>Finn tjenester og aktiviteter med kilder fra kommunen.</p></div>', unsafe_allow_html=True)
 
-# Filtrering er lokal og rask. AI-svar og nummererte AI-kilder endres ikke.
-if st.session_state.pop("refresh_last", False) and st.session_state.messages:
-    last = st.session_state.messages[-1]
-    if last.get("role") == "assistant" and last.get("raw_docs") is not None:
-        docs = filter_and_sort_documents(
-            [dict(d) for d in last["raw_docs"]],
-            valgt_malgruppe, valgt_omrade, valgt_type, valgt_sortering)
-        if valgt_sortering == "Mest relevant":
-            docs = diversify(docs)
-        last["filtered_docs"] = docs
-        last["filtered_total"] = len(docs)
-        last["filters"] = dict(valgte)
-        st.session_state[f"page_{last.get('id')}_candidates"] = 1
-        # Tell bare hele databasen for informasjonstype; bydel og maalgruppe
-        # er avgrenset i de inntil 300 lagrede kandidatene.
-        last["actual_total"] = count_full_search_matches(last.get("count_context"), valgt_type)
+# Filtre gjelder bare nye soek. Eldre svar og kilder endres ikke.
+# Dette hindrer at et tidligere AI-svar ser ut til aa gjelde nye filtre.
 
 example_clicked = None
 if not st.session_state.messages:
@@ -1568,7 +1532,7 @@ if question and question.strip():
                    "choices": choices, "query": asked,
                    "filters": {"målgruppe": valgt_malgruppe, "område": valgt_omrade,
                                "informasjonstype": valgt_type, "sortering": valgt_sortering},
-                   "id": answer_id, "raw_docs": raw_docs, "query_corrected": question,
+                   "id": answer_id, "raw_docs": raw_docs, "display_docs": docs, "query_corrected": question,
                    "count_context": count_context, "actual_total": actual_total,
                    "all_total": all_total,
                    "ai_input_ids": ai_input_ids}
