@@ -1440,7 +1440,10 @@ def scroll_to_latest_answer(max_ms=6000):
           if (main) main.style.paddingBottom = 'max(85vh, 720px)';
           for (const s of scrollers(q)) {
             const isDoc = s === doc.scrollingElement || s === doc.documentElement;
-            const top = isDoc ? 0 : s.getBoundingClientRect().top;
+            // Streamlit's fixed top bar covers the first ~60px; place the question under it.
+            const header = doc.querySelector('[data-testid="stHeader"], header');
+            const headerBottom = header ? Math.max(0, header.getBoundingClientRect().bottom) : 0;
+            const top = Math.max(isDoc ? 0 : s.getBoundingClientRect().top, headerBottom);
             const delta = q.getBoundingClientRect().top - top - gap;
             if (Math.abs(delta) > 2) s.scrollTop += delta;
           }
