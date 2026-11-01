@@ -1418,6 +1418,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
     st.session_state.session_id = uuid.uuid4().hex[:8]
+if "question_widget_version" not in st.session_state:
+    st.session_state.question_widget_version = 0
 
 # Sidepanelet fungerer pa PC og kollapser automatisk pa mobil.
 def aktive_filtre():
@@ -1454,7 +1456,9 @@ def ny_samtale():
     st.session_state["filter_type"] = "Alle"
     st.session_state["filter_sortering"] = "Mest relevant"
     st.session_state.pop("refresh_last", None)
-    st.session_state["sporsmal_input"] = ""
+    # Bruk ny widget-noekkel slik at Streamlit oppretter et tomt tekstfelt.
+    # Dette fungerer ogsaa naar tekstfeltet ligger inne i en st.form.
+    st.session_state.question_widget_version += 1
     st.session_state.pop("pending_q", None)
 
 
@@ -1469,7 +1473,7 @@ with st.sidebar:
     st.button("Nullstill filtre", on_click=nullstill_filtre, use_container_width=True)
     st.divider()
     with st.form("sporsmal_form", clear_on_submit=False):
-        skrevet = st.text_area("Still et spørsmål", key="sporsmal_input", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
+        skrevet = st.text_area("Still et spørsmål", key=f"sporsmal_input_{st.session_state.question_widget_version}", placeholder="For eksempel: Hvilke aktiviteter finnes for ungdom i Åsane?", height=235)
         sendt = st.form_submit_button("Søk og få svar", use_container_width=True, type="secondary")
     st.button("＋ Ny samtale", on_click=ny_samtale, use_container_width=True, type="secondary")
     st.caption("Ikke skriv inn personopplysninger. Kontroller detaljer hos kommunen.")
